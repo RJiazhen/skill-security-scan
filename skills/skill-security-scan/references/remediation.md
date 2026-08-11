@@ -25,7 +25,7 @@
 - Confirm whether the user ever asked for that platform.
 - Prefer host-native workflows; remove skills whose description auto-triggers on
   generic “software development” intents.
-- Revoke OAuth/tokens for the third-party CLI if uploads may have occurred.
+- Revoke third-party CLI tokens if uploads may have occurred.
 
 ## L3 supply-chain steps
 

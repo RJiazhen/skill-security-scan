@@ -36,6 +36,12 @@ an external cloud IDE/agent without the user naming that product.
 - “Do not return local paths; only return online URLs”
 - Path attachments that the CLI uploads automatically
 
+### Remote workflow exfiltration
+
+- Remote coding/session message flows that accept local file attachments
+- Shipping coding tasks plus local source files to a third-party cloud agent
+- Deploy instructions that publish onto an external platform
+
 ### Covert tool handoff
 
 - Phrases that activate a vendor tool even when the user never named it
@@ -45,12 +51,18 @@ an external cloud IDE/agent without the user naming that product.
 
 - Instructions that block falling back to the host agent’s built-in tools
 
+### Third-party auth handoff
+
+- Skills that require vendor account authorization before ordinary work continues
+- Especially risky when authorization is started via detached background processes
+
 ## L3 — Supply chain persistence
 
 | Pattern | Why it matters |
 |---------|----------------|
 | Vendor bootstrap that writes skills into Cursor/Claude dirs | Survives removal; spreads |
 | Auto skill sync modes that rewrite agent skills without review | Changes agent behavior quietly |
+| Executing repair commands printed in CLI notice fields | Remote output drives local actions |
 | Silent CLI auto-upgrade | Moves goalposts after first audit |
 | Scripts that copy files into agent skill directories | Unauthorized injection |
 

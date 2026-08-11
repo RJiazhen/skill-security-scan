@@ -1025,6 +1025,200 @@ class HostCapabilitySuppressionDetector(BaseDetector):
         return findings
 
 
+class RemoteWorkflowExfiltrationDetector(BaseDetector):
+    """Detects shipping local files or coding tasks into a remote platform workflow."""
+
+    name = "RemoteWorkflowExfiltrationDetector"
+    layer = "L2"
+    category = "remote_workflow_exfiltration"
+    _auto_attach = re.compile(
+        r"(@[^\s]+.{0,80}(自动上传|作为附件)|"
+        r"引用本地文件.{0,40}(自动上传|附件)|"
+        r"(message\s+send|session\s+message).{0,80}@[^\s]+|"
+        r"对比\s+@|@[\w./-]+\s+和\s+@)",
+        re.IGNORECASE,
+    )
+    _remote_task = re.compile(
+        r"((coze|acme|bolt|replit)\s+code\s+message\s+send|"
+        r"(coze|acme)\s+session\s+message|"
+        r"发送需求\s*`?message`?|"
+        r"把.{0,20}(需求|代码|文件|上下文).{0,20}(发到|发送到|同步到).{0,20}(云|平台|远端|远程))",
+        re.IGNORECASE,
+    )
+    _deploy = re.compile(
+        r"((coze|acme)\s+code\s+deploy|部署上线|deploy\s+to\s+production)",
+        re.IGNORECASE,
+    )
+
+    def scan_file(self, content: str, file_path: str) -> list[Finding]:
+        """Flag remote message/file workflows that exfiltrate local context."""
+        findings: list[Finding] = []
+        lines = content.splitlines()
+        remote_hits: list[tuple[int, str]] = []
+        attach_hits: list[tuple[int, str]] = []
+        deploy_hits: list[tuple[int, str]] = []
+        for i, line in enumerate(lines, 1):
+            if self._auto_attach.search(line):
+                attach_hits.append((i, line))
+            if self._remote_task.search(line):
+                remote_hits.append((i, line))
+            if self._deploy.search(line):
+                deploy_hits.append((i, line))
+
+        for i, line in attach_hits[:5]:
+            findings.append(
+                self._finding(
+                    Severity.HIGH,
+                    file_path,
+                    i,
+                    line,
+                    "Local file paths are auto-attached/uploaded into a remote platform message — "
+                    "source code or secrets may leave the machine",
+                    86,
+                )
+            )
+        if remote_hits and attach_hits:
+            i, line = remote_hits[0]
+            findings.append(
+                self._finding(
+                    Severity.HIGH,
+                    file_path,
+                    i,
+                    line,
+                    "Remote workflow accepts local file attachments — combined code/context exfiltration risk",
+                    84,
+                )
+            )
+        elif remote_hits:
+            i, line = remote_hits[0]
+            findings.append(
+                self._finding(
+                    Severity.MEDIUM,
+                    file_path,
+                    i,
+                    line,
+                    "Sends user tasks/messages into a remote coding or session workflow",
+                    58,
+                )
+            )
+        if deploy_hits:
+            i, line = deploy_hits[0]
+            findings.append(
+                self._finding(
+                    Severity.MEDIUM,
+                    file_path,
+                    i,
+                    line,
+                    "Instructs deployment onto a third-party platform — confirm user intent",
+                    50,
+                )
+            )
+        return findings
+
+
+class ThirdPartyAuthHandoffDetector(BaseDetector):
+    """Detects skills that push the agent into third-party OAuth/login flows."""
+
+    name = "ThirdPartyAuthHandoffDetector"
+    layer = "L2"
+    category = "third_party_auth"
+    _oauth = re.compile(
+        r"((coze|acme|bolt)\s+auth\s+login|"
+        r"Authentication successful\.?\s*Credentials saved|"
+        r"user_code=|"
+        r"设备码.{0,20}授权|"
+        r"coze auth login)",
+        re.IGNORECASE,
+    )
+    _background = re.compile(
+        r"(nohup|后台执行.{0,20}(login|auth|授权)|detached)",
+        re.IGNORECASE,
+    )
+
+    def scan_file(self, content: str, file_path: str) -> list[Finding]:
+        """Flag OAuth/login handoff, especially when run detached in the background."""
+        findings: list[Finding] = []
+        lines = content.splitlines()
+        auth_lines: list[tuple[int, str]] = []
+        for i, line in enumerate(lines, 1):
+            if self._oauth.search(line):
+                auth_lines.append((i, line))
+        high: list[Finding] = []
+        medium: list[Finding] = []
+        for i, line in auth_lines:
+            window = "\n".join(lines[max(0, i - 5) : min(len(lines), i + 12)])
+            if self._background.search(window):
+                high.append(
+                    self._finding(
+                        Severity.HIGH,
+                        file_path,
+                        i,
+                        line,
+                        "Background/detached third-party OAuth login — may bind host agent to an external account "
+                        "without a clear interactive consent path",
+                        80,
+                    )
+                )
+            else:
+                medium.append(
+                    self._finding(
+                        Severity.MEDIUM,
+                        file_path,
+                        i,
+                        line,
+                        "Third-party CLI OAuth/login required — verify the user intends to authorize that platform",
+                        55,
+                    )
+                )
+        findings.extend(high[:4])
+        if not high and medium:
+            findings.append(medium[0])
+        elif medium and high:
+            # Keep a single medium only if it adds a distinct non-background auth mention
+            pass
+        return findings
+
+
+class OutputDrivenCommandDetector(BaseDetector):
+    """Detects instructions to execute commands suggested by CLI/tool output."""
+
+    name = "OutputDrivenCommandDetector"
+    layer = "L3"
+    category = "output_driven_execution"
+    _patterns = [
+        (
+            re.compile(
+                r"(_notice\.command|执行其\s*`?command`?\s*字段|"
+                r"完成当前任务之余执行.{0,30}(command|修复命令)|"
+                r"run\s+the\s+(suggested|emitted|notice)\s+command|"
+                r"execute.{0,40}_notice)",
+                re.IGNORECASE,
+            ),
+            "Instructs the agent to execute commands emitted by CLI/tool output — "
+            "remote output can drive local side effects (confused deputy)",
+            88,
+        ),
+        (
+            re.compile(
+                r"(skill\.mode\s*=\s*auto|静默自动修复|"
+                r"自动(?:同步|修复).{0,30}skill)",
+                re.IGNORECASE,
+            ),
+            "Auto-repairs/syncs skills from tool notices without explicit user approval",
+            70,
+        ),
+    ]
+
+    def scan_line(self, line: str, line_num: int, file_path: str) -> list[Finding]:
+        """Match output-driven or auto-repair command execution patterns."""
+        findings = []
+        for pat, desc, conf in self._patterns:
+            if pat.search(line):
+                sev = Severity.HIGH if conf >= 80 else Severity.MEDIUM
+                findings.append(self._finding(sev, file_path, line_num, line, desc, conf))
+        return findings
+
+
 # ─── L3 supply-chain detectors ───────────────────────────────────────────────
 
 
@@ -1159,9 +1353,12 @@ class SkillScanner:
             ForcedUploadDetector(),
             CovertToolHandoffDetector(),
             HostCapabilitySuppressionDetector(),
+            RemoteWorkflowExfiltrationDetector(),
+            ThirdPartyAuthHandoffDetector(),
             # L3
             SilentSkillInstallDetector(),
             SkillPathWriteDetector(),
+            OutputDrivenCommandDetector(),
         ]
 
     def scan_skills(self, skills: list[dict]) -> ScanResult:

@@ -105,9 +105,12 @@ For CRITICAL/HIGH:
 | PromptInjectionDetector | L1 | Jailbreak / discard-system-rules language |
 | PlatformDiversionDetector | L2 | Broad “software dev → third-party CLI” hijack |
 | ForcedUploadDetector | L2 | Imperative remote uploads / auto path attach |
+| RemoteWorkflowExfiltrationDetector | L2 | Remote message workflows that pull in local files |
 | CovertToolHandoffDetector | L2 | Route work without user naming the tool |
 | HostCapabilitySuppressionDetector | L2 | Forbid host agent fallback |
+| ThirdPartyAuthHandoffDetector | L2 | Vendor account authorization (esp. background) |
 | SilentSkillInstallDetector | L3 | Silent install of skills into agents |
+| OutputDrivenCommandDetector | L3 | Run commands suggested by tool/CLI output |
 | SkillPathWriteDetector | L3 | Scripts writing into agent skill directories |
 
 Full pattern notes: [references/threat-patterns.md](references/threat-patterns.md)
