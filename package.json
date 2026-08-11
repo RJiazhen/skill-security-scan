@@ -1,0 +1,33 @@
+{
+  "name": "skill-security-scan",
+  "version": "1.0.0",
+  "description": "Comprehensive security scanner for installed AI agent skills (malware, diversion, forced upload, supply chain).",
+  "license": "MIT",
+  "keywords": [
+    "agent-skills",
+    "skills",
+    "security",
+    "audit",
+    "malware",
+    "cursor",
+    "claude"
+  ],
+  "files": [
+    "skills/**/*",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "scan": "python3 skills/skill-security-scan/scripts/scan.py --no-color",
+    "scan:json": "python3 skills/skill-security-scan/scripts/scan.py --json --no-color",
+    "test": "python3 -m unittest discover -s test -v"
+  },
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

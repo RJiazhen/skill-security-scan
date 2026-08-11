@@ -1,0 +1,13 @@
+NOTICE
+======
+
+This project includes threat-intelligence indicators adapted from publicly
+documented malicious agent-skill research, including material distributed under
+the MIT License by smartchainark/skill-security-audit (Copyright (c) 2026
+smartchainark), which cites SlowMist ClawHub analysis.
+
+The scanner implementation in this repository is original work. Detector
+categories overlap with common industry practice for agent-skill auditing.
+
+Attribution does not imply endorsement by SlowMist, smartchainark, or any
+other third party.
