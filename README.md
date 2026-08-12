@@ -19,9 +19,10 @@ Built to cover gaps that malware-only scanners miss — for example skills that 
 ## Install
 
 ```bash
-npx skills add RJiazhen/skill-security-scan -g -y
+npx skills add RJiazhen/skill-security-scan -g -y -a cursor
 ```
 
+If you see `PromptScript does not support global skill installation`, add `-a cursor` (or another supported agent). Do not install globally to PromptScript.
 After install, use it directly in Cursor / Claude (or similar) agent chats.
 
 ---
@@ -40,7 +41,11 @@ Or more casually:
 
 > Check for malicious skills / run a skill security scan.
 
-The agent follows this skill’s workflow, auto-discovers local skill directories, runs the scanner, and summarizes CRITICAL / HIGH / MEDIUM / LOW findings.
+The agent follows this skill’s workflow, auto-discovers local skill directories, runs the scanner, and leads with a **risk statement summary** (CRITICAL / HIGH / MEDIUM / LOW), then details if needed.
+
+To ask for summaries only:
+
+> Use skill-security-scan and only show the risk statement summary.
 
 ### Example 2: Focus on diversion and silent upload
 
@@ -102,6 +107,7 @@ Common auto-discovered paths:
 
 - `~/.cursor/skills`, project `.cursor/skills`
 - `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`
+- `~/.trae/skills`, `~/.trae-cn/skills`, project `.trae/skills` (Trae / Trae CN)
 - `~/.openclaw/**/skills`, `~/.coze/skills`, and similar
 
 | Detector | Layer | Catches |
@@ -133,11 +139,17 @@ Most users **do not** need this. Use it for CI, local development, or when the a
 # Scan the machine
 python3 skills/skill-security-scan/scripts/scan.py --no-color
 
+# Risk statement summary only
+python3 skills/skill-security-scan/scripts/scan.py --summary-only --severity medium --no-color
+
 # Scan one directory
 python3 skills/skill-security-scan/scripts/scan.py --path /path/to/skill --no-color
 
-# JSON
+# JSON (includes risk_summaries)
 python3 skills/skill-security-scan/scripts/scan.py --json --severity medium --no-color
+
+# Plain text without emoji (CI / logs)
+python3 skills/skill-security-scan/scripts/scan.py --summary-only --no-emoji --no-color
 ```
 
 Exit codes: `0` clean · `1` low/medium · `2` high · `3` critical

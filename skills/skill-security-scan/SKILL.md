@@ -48,6 +48,7 @@ Auto-discovers skills under:
 
 - `~/.cursor/skills`, project `.cursor/skills`
 - `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`
+- `~/.trae/skills`, `~/.trae-cn/skills`, project `.trae/skills` (Trae / Trae CN)
 - `~/.openclaw/**/skills`, `~/.coze/skills` (and common Coze app support paths)
 
 ### 2. Optional targets
@@ -67,23 +68,41 @@ python3 scripts/scan.py --ioc-db /path/to/ioc_database.json
 
 ### 3. Report to the user
 
-Summarize:
+Prefer the scanner’s **RISK STATEMENT SUMMARY** (or `--summary-only` / JSON `risk_summaries`).
+Present it first, then details if the user wants them.
 
 ```markdown
 ## Audit summary
 - Skills scanned: N
 - Files scanned: N
-- CRITICAL / HIGH / MEDIUM / LOW: n / n / n / n
+- 🔴 CRITICAL / 🟠 HIGH / 🟡 MEDIUM / 🔵 LOW: n / n / n / n
+
+## Risk statement summary
+For each item (deduped by skill + category):
+- 🔴/🟠/🟡/🔵 [SEVERITY] skill-name
+  - ⚠️ Risk: <one-sentence risk statement>
+  - 📝 Evidence: <short quote from SKILL.md / script>
+  - Category / layer / detectors
 
 ## Critical & high (action required)
-- Skill · detector · layer · why it matters · recommended action
+- Only if the user asks for detail: skill · detector · file:line · action
 
 ## Medium & low
 - Brief list; note likely false positives
 ```
 
-Call out **L2/L3** findings explicitly (diversion, forced upload, silent install) —
-these are often missed by malware-only scanners.
+Keep emoji severity markers in chat replies for readability (same mapping as the CLI report).
+Use `--no-emoji` only when the user asks for plain text / CI logs.
+
+Call out **L2/L3** risk statements explicitly (diversion, forced upload, silent install,
+remote workflow, output-driven commands) — these are often missed by malware-only scanners.
+
+Example CLI for summary-first reporting:
+
+```bash
+python3 scripts/scan.py --summary-only --severity medium --no-color
+python3 scripts/scan.py --json --severity high
+```
 
 ### 4. Remediate
 

@@ -158,7 +158,7 @@ SCANNER_SELF_MARKER = "skill-security-scan:scanner"
 
 
 class SkillDiscovery:
-    """Finds skill directories across Cursor, Claude, Codex, OpenClaw, and agents."""
+    """Finds skill directories across Cursor, Claude, Codex, Trae, OpenClaw, and agents."""
 
     def discover(self, project_root: Optional[Path] = None) -> list[dict]:
         """Return skill records for all known install locations."""
@@ -172,6 +172,9 @@ class SkillDiscovery:
             home / ".openclaw" / "workspace" / "skills",
             home / ".openclaw" / "skills",
             home / ".kimi-code" / "skills",
+            # Trae / Trae CN (skills CLI: ~/.trae/skills, ~/.trae-cn/skills)
+            home / ".trae" / "skills",
+            home / ".trae-cn" / "skills",
         ]
 
         if project_root is None:
@@ -181,6 +184,7 @@ class SkillDiscovery:
                 project_root / ".cursor" / "skills",
                 project_root / ".claude" / "skills",
                 project_root / ".agents" / "skills",
+                project_root / ".trae" / "skills",
             ]
         )
 
@@ -1274,6 +1278,7 @@ class SkillPathWriteDetector(BaseDetector):
         (
             re.compile(
                 r"(\.cursor/skills|\.claude/skills|\.agents/skills|\.codex/skills|"
+                r"\.trae(?:-cn)?/skills|"
                 r"\.openclaw/.*/skills)",
                 re.IGNORECASE,
             ),
@@ -1283,7 +1288,7 @@ class SkillPathWriteDetector(BaseDetector):
         (
             re.compile(
                 r"(cp|copy|writeFile|mkdir|os\.makedirs).{0,80}"
-                r"(\.cursor/skills|\.claude/skills|\.agents/skills)",
+                r"(\.cursor/skills|\.claude/skills|\.agents/skills|\.trae(?:-cn)?/skills)",
                 re.IGNORECASE,
             ),
             "Writes into agent skill directories — possible unauthorized skill injection",
@@ -1389,6 +1394,69 @@ class SkillScanner:
 
 SEVERITY_ORDER = [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW]
 
+SEVERITY_EMOJI = {
+    Severity.CRITICAL: "🔴",
+    Severity.HIGH: "🟠",
+    Severity.MEDIUM: "🟡",
+    Severity.LOW: "🔵",
+}
+
+LAYER_EMOJI = {
+    "L1": "💣",
+    "L2": "🎭",
+    "L3": "📦",
+}
+
+CATEGORY_RISK_TITLES = {
+    "remote_code_execution": "Remote code execution via download-and-run",
+    "threat_intelligence": "Known malicious indicator (IOC) match",
+    "obfuscation": "Obfuscated or encoded payload patterns",
+    "data_exfiltration": "Sensitive data collection/upload patterns",
+    "credential_theft": "Credential or secret access patterns",
+    "persistence": "Persistence / auto-start mechanisms",
+    "supply_chain": "Install-hook / supply-chain code execution",
+    "prompt_injection": "Prompt-injection / jailbreak language",
+    "social_engineering": "Social-engineering naming or framing",
+    "network_access": "Unexpected network access primitives",
+    "privilege_escalation": "Privilege escalation patterns",
+    "platform_diversion": "Silent diversion of workflows to a third-party platform",
+    "forced_exfiltration": "Mandatory upload of local content to a remote platform",
+    "covert_tool_handoff": "Routing work to tools/platforms without explicit user request",
+    "host_suppression": "Blocking fallback to the host agent's own capabilities",
+    "remote_workflow_exfiltration": "Sending local files/tasks into a remote platform workflow",
+    "third_party_auth": "Third-party account authorization / OAuth handoff",
+    "supply_chain_persistence": "Silent skill install or persistence into agent directories",
+    "output_driven_execution": "Executing commands suggested by tool/CLI output",
+    "generic": "Suspicious skill behavior",
+}
+
+
+@dataclass
+class RiskSummary:
+    """Deduped risk statement for a skill/category pair."""
+
+    severity: Severity
+    layer: str
+    category: str
+    skill_name: str
+    statement: str
+    evidence: str
+    count: int
+    detectors: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """Serialize the risk summary for JSON output."""
+        return {
+            "severity": str(self.severity),
+            "layer": self.layer,
+            "category": self.category,
+            "skill_name": self.skill_name,
+            "statement": self.statement,
+            "evidence": self.evidence,
+            "count": self.count,
+            "detectors": self.detectors,
+        }
+
 
 def filter_findings(
     findings: Iterable[Finding], min_severity: Severity
@@ -1397,7 +1465,94 @@ def filter_findings(
     return [f for f in findings if f.severity >= min_severity]
 
 
-def print_report(result: ScanResult, use_color: bool = True) -> None:
+def build_risk_summaries(findings: Iterable[Finding]) -> list[RiskSummary]:
+    """Collapse findings into per-skill risk statements for the summary section."""
+    grouped: dict[tuple[str, str], list[Finding]] = {}
+    for f in findings:
+        key = (f.skill_name or "(unknown)", f.category)
+        grouped.setdefault(key, []).append(f)
+
+    summaries: list[RiskSummary] = []
+    for (skill_name, category), items in grouped.items():
+        top = max(items, key=lambda x: (int(x.severity), x.confidence))
+        title = CATEGORY_RISK_TITLES.get(category, top.description)
+        # Prefer the concrete detector description when it is more specific than the title.
+        statement = top.description if top.description else title
+        evidence = next((i.line_content for i in items if i.line_content), "")
+        detectors = sorted({i.detector for i in items})
+        summaries.append(
+            RiskSummary(
+                severity=top.severity,
+                layer=top.layer,
+                category=category,
+                skill_name=skill_name,
+                statement=statement,
+                evidence=evidence[:180],
+                count=len(items),
+                detectors=detectors,
+            )
+        )
+
+    summaries.sort(key=lambda s: (-int(s.severity), s.skill_name, s.category))
+    return summaries
+
+
+def severity_label(severity: Severity, use_emoji: bool = True) -> str:
+    """Format a severity tag, optionally with a leading emoji."""
+    if use_emoji:
+        return f"{SEVERITY_EMOJI.get(severity, '⚪')} [{severity}]"
+    return f"[{severity}]"
+
+
+def layer_label(layer: str, use_emoji: bool = True) -> str:
+    """Format a layer tag, optionally with a leading emoji."""
+    if use_emoji:
+        return f"{LAYER_EMOJI.get(layer, '📎')} {layer}"
+    return layer
+
+
+def print_risk_summary(
+    summaries: list[RiskSummary], use_color: bool = True, use_emoji: bool = True
+) -> None:
+    """Print the condensed risk-statement summary block."""
+    colors = {
+        Severity.CRITICAL: "\033[91m" if use_color else "",
+        Severity.HIGH: "\033[91m" if use_color else "",
+        Severity.MEDIUM: "\033[93m" if use_color else "",
+        Severity.LOW: "\033[94m" if use_color else "",
+    }
+    reset = "\033[0m" if use_color else ""
+    title = "📋 RISK STATEMENT SUMMARY" if use_emoji else "RISK STATEMENT SUMMARY"
+
+    print(f"  {title}")
+    print("  " + "-" * 66)
+    if not summaries:
+        print("  (none)")
+        print()
+        return
+    for s in summaries:
+        c = colors.get(s.severity, "")
+        label = severity_label(s.severity, use_emoji=use_emoji)
+        print(f"  {c}{label}{reset} {s.skill_name}")
+        print(f"    {'⚠️  ' if use_emoji else ''}Risk: {s.statement}")
+        print(
+            f"    Category: {s.category}  "
+            f"Layer: {layer_label(s.layer, use_emoji=use_emoji)}  "
+            f"Hits: {s.count}"
+        )
+        if s.detectors:
+            print(f"    {'🔎 ' if use_emoji else ''}Detectors: {', '.join(s.detectors)}")
+        if s.evidence:
+            print(f"    {'📝 ' if use_emoji else ''}Evidence: {s.evidence}")
+        print()
+
+
+def print_report(
+    result: ScanResult,
+    use_color: bool = True,
+    summary_only: bool = False,
+    use_emoji: bool = True,
+) -> None:
     """Print a human-readable audit report to stdout."""
     colors = {
         Severity.CRITICAL: "\033[91m" if use_color else "",
@@ -1407,42 +1562,62 @@ def print_report(result: ScanResult, use_color: bool = True) -> None:
     }
     reset = "\033[0m" if use_color else ""
     counts = result.counts_by_severity()
+    summaries = build_risk_summaries(result.findings)
+    report_title = "🛡️  SKILL SECURITY SCAN REPORT" if use_emoji else "SKILL SECURITY SCAN REPORT"
 
     print("=" * 70)
-    print("  SKILL SECURITY SCAN REPORT")
-    print(f"  Skills: {result.skills_scanned}  Files: {result.files_scanned}")
+    print(f"  {report_title}")
+    print(
+        f"  {'📦 ' if use_emoji else ''}Skills: {result.skills_scanned}  "
+        f"{'📄 ' if use_emoji else ''}Files: {result.files_scanned}"
+    )
     if result.skill_roots:
-        print("  Roots:")
+        print(f"  {'📂 ' if use_emoji else ''}Roots:")
         for root in result.skill_roots:
             print(f"    - {root}")
     print("=" * 70)
     print(
-        f"  CRITICAL: {counts['CRITICAL']}  HIGH: {counts['HIGH']}  "
-        f"MEDIUM: {counts['MEDIUM']}  LOW: {counts['LOW']}"
+        f"  {SEVERITY_EMOJI[Severity.CRITICAL] if use_emoji else ''} CRITICAL: {counts['CRITICAL']}  "
+        f"{SEVERITY_EMOJI[Severity.HIGH] if use_emoji else ''} HIGH: {counts['HIGH']}  "
+        f"{SEVERITY_EMOJI[Severity.MEDIUM] if use_emoji else ''} MEDIUM: {counts['MEDIUM']}  "
+        f"{SEVERITY_EMOJI[Severity.LOW] if use_emoji else ''} LOW: {counts['LOW']}"
     )
     print()
 
     if not result.findings:
-        print("  [CLEAN] No security issues detected.")
+        clean = "✅ [CLEAN] No security issues detected." if use_emoji else "[CLEAN] No security issues detected."
+        print(f"  {clean}")
         print()
+        return
+
+    print_risk_summary(summaries, use_color=use_color, use_emoji=use_emoji)
+    if summary_only:
         return
 
     by_skill: dict[str, list[Finding]] = {}
     for f in sorted(result.findings, key=lambda x: (-int(x.severity), x.skill_name, x.file_path)):
         by_skill.setdefault(f.skill_name or "(unknown)", []).append(f)
 
+    detail_title = "🔍 DETAILED FINDINGS" if use_emoji else "DETAILED FINDINGS"
+    print(f"  {detail_title}")
+    print("  " + "-" * 66)
     for skill_name, findings in by_skill.items():
         print("-" * 70)
-        print(f"  Skill: {skill_name}  ({len(findings)} finding(s))")
+        skill_prefix = "🧩 " if use_emoji else ""
+        print(f"  {skill_prefix}Skill: {skill_name}  ({len(findings)} finding(s))")
         for f in findings:
             c = colors.get(f.severity, "")
-            print(f"    {c}[{f.severity}]{reset} [{f.layer}] {f.detector}")
+            label = severity_label(f.severity, use_emoji=use_emoji)
+            print(
+                f"    {c}{label}{reset} "
+                f"[{layer_label(f.layer, use_emoji=use_emoji)}] {f.detector}"
+            )
             print(f"      Category: {f.category}")
-            print(f"      File: {f.file_path}:{f.line_number}")
-            print(f"      {f.description}")
+            print(f"      {'📁 ' if use_emoji else ''}File: {f.file_path}:{f.line_number}")
+            print(f"      {'⚠️  ' if use_emoji else ''}{f.description}")
             print(f"      Confidence: {f.confidence}%")
             if f.line_content:
-                print(f"      > {f.line_content}")
+                print(f"      {'📝 ' if use_emoji else ''}> {f.line_content}")
             print()
 
 
@@ -1485,12 +1660,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--json", action="store_true", help="Emit JSON instead of text report")
     p.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Print only the risk statement summary (ignored with --json)",
+    )
+    p.add_argument(
         "--severity",
         type=parse_severity,
         default=Severity.LOW,
         help="Minimum severity to report (default: low)",
     )
     p.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+    p.add_argument(
+        "--no-emoji",
+        action="store_true",
+        help="Disable emoji markers in the text report",
+    )
     p.add_argument(
         "--ioc-db",
         help="Path to an alternate IOC JSON database",
@@ -1515,6 +1700,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     scanner = SkillScanner(ioc)
     result = scanner.scan_skills(skills)
     result.findings = filter_findings(result.findings, args.severity)
+    summaries = build_risk_summaries(result.findings)
 
     if args.json:
         payload = {
@@ -1522,11 +1708,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             "files_scanned": result.files_scanned,
             "skill_roots": result.skill_roots,
             "severity_counts": result.counts_by_severity(),
+            "risk_summaries": [s.to_dict() for s in summaries],
             "findings": [f.to_dict() for f in result.findings],
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print_report(result, use_color=not args.no_color and sys.stdout.isatty())
+        print_report(
+            result,
+            use_color=not args.no_color and sys.stdout.isatty(),
+            summary_only=args.summary_only,
+            use_emoji=not args.no_emoji,
+        )
 
     return exit_code_for(result)
 

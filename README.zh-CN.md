@@ -19,9 +19,10 @@ English: [README.md](README.md) · 仓库：https://github.com/RJiazhen/skill-se
 ## 安装
 
 ```bash
-npx skills add RJiazhen/skill-security-scan -g -y
+npx skills add RJiazhen/skill-security-scan -g -y -a cursor
 ```
 
+若出现 `PromptScript does not support global skill installation`，加上 `-a cursor`（或其它支持的 agent）即可；PromptScript 不支持全局 skill 安装。
 安装后即可在 Cursor / Claude 等 Agent 对话里直接使用。
 
 ---
@@ -40,7 +41,11 @@ npx skills add RJiazhen/skill-security-scan -g -y
 
 > 检查一下有没有恶意 skill / 技能安全扫描。
 
-Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描，再整理 CRITICAL / HIGH / MEDIUM / LOW 报告。
+Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描，**优先给出风险语句摘要**（CRITICAL / HIGH / MEDIUM / LOW），再按需展开明细。
+
+若只要摘要：
+
+> 用 skill-security-scan 扫描，只显示风险语句摘要。
 
 ### 示例 2：重点查导流与静默上传
 
@@ -102,6 +107,7 @@ Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描
 
 - `~/.cursor/skills`、项目内 `.cursor/skills`
 - `~/.claude/skills`、`~/.agents/skills`、`~/.codex/skills`
+- `~/.trae/skills`、`~/.trae-cn/skills`、项目内 `.trae/skills`（Trae / Trae CN）
 - `~/.openclaw/**/skills`、`~/.coze/skills` 等
 
 | 检测器 | 层级 | 主要捕获 |
@@ -133,11 +139,17 @@ Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描
 # 扫本机
 python3 skills/skill-security-scan/scripts/scan.py --no-color
 
+# 只看风险语句摘要
+python3 skills/skill-security-scan/scripts/scan.py --summary-only --severity medium --no-color
+
 # 扫单个目录
 python3 skills/skill-security-scan/scripts/scan.py --path /path/to/skill --no-color
 
-# JSON
+# JSON（含 risk_summaries）
 python3 skills/skill-security-scan/scripts/scan.py --json --severity medium --no-color
+
+# 关闭 emoji（CI / 纯文本日志）
+python3 skills/skill-security-scan/scripts/scan.py --summary-only --no-emoji --no-color
 ```
 
 退出码：`0` 干净 · `1` low/medium · `2` high · `3` critical

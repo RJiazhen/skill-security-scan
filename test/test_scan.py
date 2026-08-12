@@ -195,6 +195,42 @@ class DiscoveryAndCliTests(unittest.TestCase):
         payload = json.loads(buf.getvalue())
         self.assertGreaterEqual(payload["severity_counts"]["CRITICAL"], 1)
         self.assertTrue(payload["findings"])
+        self.assertTrue(payload["risk_summaries"])
+        self.assertIn("statement", payload["risk_summaries"][0])
+
+    def test_build_risk_summaries_dedupes_by_skill_and_category(self) -> None:
+        """Risk summaries should collapse multiple hits in the same category."""
+        findings = [
+            scan.Finding(
+                detector="ForcedUploadDetector",
+                severity=scan.Severity.HIGH,
+                layer="L2",
+                category="forced_exfiltration",
+                file_path="a.md",
+                line_number=1,
+                line_content="must upload",
+                description="Mandatory upload of local files to a remote platform",
+                confidence=88,
+                skill_name="demo",
+            ),
+            scan.Finding(
+                detector="ForcedUploadDetector",
+                severity=scan.Severity.MEDIUM,
+                layer="L2",
+                category="forced_exfiltration",
+                file_path="a.md",
+                line_number=2,
+                line_content="upload again",
+                description="Platform/file upload command present",
+                confidence=55,
+                skill_name="demo",
+            ),
+        ]
+        summaries = scan.build_risk_summaries(findings)
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0].severity, scan.Severity.HIGH)
+        self.assertEqual(summaries[0].count, 2)
+        self.assertIn("Mandatory upload", summaries[0].statement)
 
     def test_discover_includes_temp_cursor_skills(self) -> None:
         """Discovery should pick up a skill placed under a fake home .cursor/skills root."""
@@ -218,6 +254,40 @@ class DiscoveryAndCliTests(unittest.TestCase):
                 Path.home = original_home  # type: ignore[assignment]
             names = {s["name"] for s in found}
             self.assertIn("demo", names)
+
+    def test_discover_includes_trae_and_trae_cn_skills(self) -> None:
+        """Discovery should include Trae and Trae CN global/project skill directories."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            project = home / "proj"
+            for rel in (
+                home / ".trae" / "skills" / "trae-global",
+                home / ".trae-cn" / "skills" / "trae-cn-global",
+                project / ".trae" / "skills" / "trae-project",
+            ):
+                rel.mkdir(parents=True)
+                (rel / "SKILL.md").write_text(
+                    "---\nname: x\ndescription: x\n---\n\n# x\n",
+                    encoding="utf-8",
+                )
+            original_home = Path.home
+
+            def _fake_home() -> Path:
+                return home
+
+            try:
+                Path.home = _fake_home  # type: ignore[assignment]
+                found = scan.SkillDiscovery().discover(project_root=project)
+            finally:
+                Path.home = original_home  # type: ignore[assignment]
+            names = {s["name"] for s in found}
+            self.assertIn("trae-global", names)
+            self.assertIn("trae-cn-global", names)
+            self.assertIn("trae-project", names)
+            roots = {s["source_root"] for s in found if s["name"].startswith("trae")}
+            self.assertTrue(any(str(home / ".trae" / "skills") == r for r in roots))
+            self.assertTrue(any(str(home / ".trae-cn" / "skills") == r for r in roots))
+            self.assertTrue(any(str(project / ".trae" / "skills") == r for r in roots))
 
 if __name__ == "__main__":
     unittest.main()
