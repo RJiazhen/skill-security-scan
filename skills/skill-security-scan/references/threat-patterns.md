@@ -44,8 +44,17 @@ an external cloud IDE/agent without the user naming that product.
 
 ### Covert tool handoff
 
-- Phrases that activate a vendor tool even when the user never named it
-- Quiet handoff of work to other agents or platforms
+Scanner candidates: phrases that activate a tool even when the user never
+named it, or that quietly hand work to another agent or platform.
+
+**Confirm before reporting** (see [review.md](review.md)):
+
+- Keep only when the destination is a **different product / vendor CLI /
+  peer agent**, not a host built-in tool.
+- Drop host guardrails that say stay on the built-in path, or that forbid
+  silently switching models/CLIs the host already ships.
+- Do not encode those names in the scanner. New skills will keep inventing
+  new tool names; the review step decides from context.
 
 ### Host capability suppression
 
@@ -77,6 +86,8 @@ an external cloud IDE/agent without the user naming that product.
 
 ## False positives
 
+- Host built-in stay-on-path / “never silently switch model” guardrails
+  (review step drops these; do not special-case tool names in the scanner)
 - Legitimate skills that *optionally* upload when the user asked for cloud share
 - Official docs mentioning agent skill directories without writing there
 - Long technical lines that are not encoded payloads (entropy detector tries to skip CJK prose)

@@ -69,7 +69,28 @@ python3 scripts/scan.py --ioc-db /path/to/ioc_database.json
 
 **Exit codes:** `0` clean · `1` low/medium · `2` high · `3` critical
 
-### 3. Report to the user
+### 3. Review candidates, then report
+
+The script only flags **candidate language**. It does not know whether a
+named tool is this host’s built-in capability or another product. **Do not
+paste the scanner file as the final report.** Do not add tool-name
+allowlists to `scan.py` when a new skill appears — apply
+[references/review.md](references/review.md) instead.
+
+**Before presenting anything, Read [references/review.md](references/review.md)
+and every cited 出处 file** around the hit line.
+
+Then:
+
+1. **Drop** hits that fail the destination test (host built-in / stay-on-path
+   guardrails are not covert handoff).
+2. **Rewrite 说明 / Note** from the source: name the real destination and
+   the user-visible effect. A generic “交给外部工具” is not enough when the
+   excerpt names a CLI (for example: may invoke `vendor code` to start a
+   software project on that platform). Do not recopy the excerpt.
+3. Recalculate 风险级别统计. Remove empty severity headings and remediation
+   subsections for dropped skills.
+4. Overwrite the markdown report file with this reviewed text.
 
 **Default = full report.** Do **not** pass `--summary-only` unless the user
 explicitly asks for a short / summary-only view.
@@ -77,9 +98,10 @@ explicitly asks for a short / summary-only view.
 **Match the user's language.** If the user writes in Chinese, run with `--lang zh`.
 English chats use `--lang en` or omit it.
 
-**Output the scanner report as-is.** You may run the scan yourself or via a
-sub-agent. Paste the markdown report body with no extra narration — no
-“完整 N 条命中已写入…”, no “下面按 skill 列出”, no recap before the `#` title.
+**Do not use captured CLI stdout as the report.** After review, `Read` the
+overwritten markdown file and paste **that** body. No extra narration — no
+“完整 N 条命中已写入…”, no “下面按 skill 列出”, no “终端输出被截断…”,
+no “已过滤误报”, no recap before the `#` title.
 
 After the report body, add **only** one line with the written file path
 (stderr: `报告已写入: …` / `Report written to: …`):
@@ -89,22 +111,29 @@ After the report body, add **only** one line with the written file path
 Hard rules:
 
 1. Default CLI (Chinese chat):
-   `python3 ~/.agents/skills/skill-security-scan/scripts/scan.py --no-color --lang zh`
+   `python3 ~/.agents/skills/skill-security-scan/scripts/scan.py --no-color --lang zh --quiet`
    (no `--summary-only`; default `--severity low` so MEDIUM/LOW are included).
-   The scanner **writes** `./skill-security-scan-report.md` unless the user says
-   not to, or the environment cannot create the file (then stdout only).
+   `--quiet` keeps the long report out of the terminal capture so it is not
+   truncated. The scanner **writes** `./skill-security-scan-report.md` unless
+   the user says not to, or the environment cannot create the file (then
+   omit `--quiet` / use `--no-md` and print stdout).
    Pass `--no-md` only when the user explicitly does not want a file
    (不要写文件 / 只输出到终端). Use `--md PATH` to choose another location.
 2. Use `--summary-only` **only** when the user asks for 摘要 / summary only.
-3. Relay the scanner markdown **verbatim**: `#` title (name + scan time),
+3. Keep the report **shape**: `#` title (name + scan time),
    `## 总体检查情况`, `## 风险项` with `###` severity and `####` risk-item
-   headings, then `## 处置方案`. Do not rename headings or drop fields.
-4. Keep **Skill** / **风险类型** / **出处** / **原文摘录** (or the English
-   equivalents). Never call the risk type a「检测器」/ detector. Preserve
-   clickable `出处` links (`file://…#L18`) and ` ```md ` excerpt fences.
-   Do not add `L18 |` prefixes or rewrite excerpts.
-5. Keep `处置方案` / `Remediation plan` **verbatim**, including `###` sub-plans
-   and ` ```bash ` command fences.
+   headings, then `## 处置方案`. Do not rename headings or drop fields on
+   items you keep.
+4. Keep **Skill** / **风险类型** / **说明** / **出处** / **原文摘录** (or
+   the English equivalents). H4 is the risk-item name; **风险类型** is the
+   short type (`L3 · 供应链持久化`), not the same sentence as the H4.
+   **说明** is your reviewed impact note (what the hit *does*), not the
+   scanner draft and not a recopy of the excerpt. Never call the type a
+   「检测器」/ detector. Preserve clickable `出处` links (`file://…#L18`)
+   and ` ```md ` excerpt fences. Do not add `L18 |` prefixes or rewrite
+   excerpts.
+5. Keep `处置方案` / `Remediation plan` **shape**, including `###` sub-plans
+   and ` ```bash ` command fences, for skills that still have findings.
 
 Chinese conversation shape (`--lang zh`, default full report):
 
@@ -124,7 +153,8 @@ Chinese conversation shape (`--lang zh`, default full report):
 #### <风险项名称>
 
 - **Skill**：`skill-name`
-- **风险类型**：<风险项名称>
+- **风险类型**：L3 · 供应链持久化
+- **说明**：`skill-name` 一旦执行 `example self skill install`，会把自带 skills 写入本机 Agent 目录并可能被自动加载。
 - **出处**：[ /path/to/SKILL.md:18 ](file:///path/to/SKILL.md#L18)
 - **原文摘录**：
 
@@ -159,7 +189,8 @@ English conversation shape (default full report):
 #### <risk item name>
 
 - **Skill**: `skill-name`
-- **Risk type**: <risk item name>
+- **Risk type**: L3 · Supply-chain persistence
+- **Note**: `skill-name` would write bundled skills into local agent directories via `example self skill install`, so they can keep loading later.
 - **Source**: [ /path/to/SKILL.md:18 ](file:///path/to/SKILL.md#L18)
 - **Excerpt**:
 
@@ -185,8 +216,8 @@ Use `--no-emoji` only for plain text / CI logs.
 Example CLI:
 
 ```bash
-# Default: full Chinese report + ./skill-security-scan-report.md
-python3 ~/.agents/skills/skill-security-scan/scripts/scan.py --no-color --lang zh
+# Default for agents: write the md file, do not dump it to stdout
+python3 ~/.agents/skills/skill-security-scan/scripts/scan.py --no-color --lang zh --quiet
 
 # No markdown file (only when the user asks)
 python3 ~/.agents/skills/skill-security-scan/scripts/scan.py --no-color --lang zh --no-md
@@ -224,7 +255,7 @@ For CRITICAL/HIGH:
 | PlatformDiversionDetector | L2 | Broad “software dev → third-party CLI” hijack |
 | ForcedUploadDetector | L2 | Imperative remote uploads / auto path attach |
 | RemoteWorkflowExfiltrationDetector | L2 | Remote message workflows that pull in local files |
-| CovertToolHandoffDetector | L2 | Route work without user naming the tool |
+| CovertToolHandoffDetector | L2 | Candidate: route-without-naming language (review destination) |
 | HostCapabilitySuppressionDetector | L2 | Forbid host agent fallback |
 | ThirdPartyAuthHandoffDetector | L2 | Vendor account authorization (esp. background) |
 | SilentSkillInstallDetector | L3 | Silent install of skills into agents |
@@ -235,15 +266,20 @@ Full pattern notes: [references/threat-patterns.md](references/threat-patterns.m
 
 ## Manual review checklist
 
-When a finding needs human judgment:
+Required for every report. Full rules: [references/review.md](references/review.md).
 
-1. Was the skill installed with clear user consent?
-2. Does the trigger scope match the stated purpose (or hijack unrelated coding tasks)?
-3. Does it require uploading local files or code to a remote platform?
-4. Does it suppress the host agent's normal tools?
-5. Does it install or sync itself into agent skill directories without review?
+1. Destination: another product / vendor CLI / peer agent, or this host’s
+   own built-in tool? Host stay-on-path guardrails are not handoff.
+2. Was the skill installed with clear user consent?
+3. Does the trigger scope match the stated purpose (or hijack unrelated coding tasks)?
+4. Does it require uploading local files or code to a remote platform?
+5. Does it suppress the host agent's normal tools so only the vendor path remains?
+6. Does it install or sync itself into agent skill directories without review?
+7. Is 说明 concrete (named destination + effect), not “交给外部工具”?
 
 ## Trust boundary
 
-This scanner is heuristic. Clean ≠ safe; HIGH ≠ proven malware. Prefer removal when
-L2 diversion + forced upload + silent install appear together on an unsolicited skill.
+This scanner is heuristic. Clean ≠ safe; HIGH ≠ proven malware. The script
+over-flags routing phrases; the review step decides. Prefer removal when
+confirmed L2 diversion + forced upload + silent install appear together on
+an unsolicited skill.

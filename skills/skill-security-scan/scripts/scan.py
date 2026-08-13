@@ -286,9 +286,14 @@ class SkillDiscovery:
         return [{"name": p.name, "path": p, "files": self._collect_files(p), "source_root": str(p.parent)}]
 
     def _collect_from_roots(self, roots: list[Path]) -> list[dict]:
-        """Walk search roots and return unique skill directories."""
+        """Walk search roots and return unique skill directories.
+
+        Symlinked installs are collapsed to the resolved directory so scan
+        roots and finding file paths stay aligned. Extra install paths are
+        kept on ``aliases``.
+        """
         skills: list[dict] = []
-        seen: set[Path] = set()
+        seen: dict[Path, dict] = {}
         for root in roots:
             if not root.is_dir():
                 continue
@@ -296,21 +301,26 @@ class SkillDiscovery:
                 if not child.is_dir():
                     continue
                 resolved = child.resolve()
-                if resolved in seen:
-                    continue
                 if is_self_scanner_skill(resolved, child.name):
                     continue
-                # Prefer directories that look like skills (SKILL.md) but include all
-                # immediate children of known skill roots.
-                seen.add(resolved)
-                skills.append(
-                    {
-                        "name": child.name,
-                        "path": child,
-                        "files": self._collect_files(child),
-                        "source_root": str(root),
-                    }
-                )
+                if resolved in seen:
+                    existing = seen[resolved]
+                    if child.is_symlink():
+                        alias = str(child)
+                        if alias not in existing["aliases"]:
+                            existing["aliases"].append(alias)
+                    continue
+                record = {
+                    "name": child.name,
+                    "path": resolved,
+                    "files": self._collect_files(resolved),
+                    "source_root": str(resolved.parent),
+                    "aliases": [],
+                }
+                if child.is_symlink():
+                    record["aliases"].append(str(child))
+                seen[resolved] = record
+                skills.append(record)
         return skills
 
     def _collect_files(self, skill_dir: Path) -> list[Path]:
@@ -1052,7 +1062,7 @@ class CovertToolHandoffDetector(BaseDetector):
     ]
 
     def scan_line(self, line: str, line_num: int, file_path: str) -> list[Finding]:
-        """Match covert handoff / silent routing language."""
+        """Match covert-handoff candidate language; the skill reviews destination."""
         findings = []
         for pat, desc, conf in self._patterns:
             if pat.search(line):
@@ -1390,6 +1400,18 @@ class DuplicateCopy:
 
 
 @dataclass
+class SymlinkRoot:
+    """A search root that only reached skills through a symlink."""
+
+    path: str
+    real_path: str
+
+    def to_dict(self) -> dict:
+        """Serialize the symlink-root record for JSON output."""
+        return {"path": self.path, "real_path": self.real_path}
+
+
+@dataclass
 class ScanResult:
     """Aggregated scan output across all skills."""
 
@@ -1397,6 +1419,7 @@ class ScanResult:
     files_scanned: int = 0
     findings: list[Finding] = field(default_factory=list)
     skill_roots: list[str] = field(default_factory=list)
+    symlink_roots: list[SymlinkRoot] = field(default_factory=list)
     skill_paths: dict[str, str] = field(default_factory=dict)
     skipped_self: list[str] = field(default_factory=list)
     duplicate_copies: list[DuplicateCopy] = field(default_factory=list)
@@ -1453,13 +1476,17 @@ class SkillScanner:
     def scan_skills(self, skills: list[dict]) -> ScanResult:
         """Scan skill records, skipping this scanner and identical copies."""
         result = ScanResult(scanned_at=format_scan_time())
-        roots = sorted({s.get("source_root", "") for s in skills if s.get("source_root")})
-        result.skill_roots = [r for r in roots if r]
         seen_hashes: dict[str, tuple[str, str]] = {}
+        scanned_roots: set[str] = set()
+        symlink_roots: dict[str, str] = {}
 
         for skill in skills:
             name = skill["name"]
             skill_dir = Path(skill.get("path") or "")
+            try:
+                skill_dir = skill_dir.resolve() if skill_dir else skill_dir
+            except OSError:
+                pass
             skill_path = str(skill_dir) if skill_dir else ""
             if skill_dir and is_self_scanner_skill(skill_dir, name):
                 result.skipped_self.append(skill_path or name)
@@ -1480,6 +1507,26 @@ class SkillScanner:
                 seen_hashes[fingerprint] = (name, skill_path)
             if skill_path:
                 result.skill_paths.setdefault(name, skill_path)
+                scanned_roots.add(str(skill_dir.parent))
+            for alias in skill.get("aliases") or []:
+                if alias and alias != skill_path:
+                    result.duplicate_copies.append(
+                        DuplicateCopy(
+                            name=name,
+                            scanned_path=skill_path,
+                            copy_path=alias,
+                        )
+                    )
+                    alias_root = str(Path(alias).parent)
+                    real_root = str(skill_dir.parent) if skill_dir else ""
+                    if not alias_root or not real_root:
+                        continue
+                    try:
+                        same_root = Path(alias_root).resolve() == Path(real_root).resolve()
+                    except OSError:
+                        same_root = alias_root == real_root
+                    if not same_root:
+                        symlink_roots[alias_root] = real_root
             result.skills_scanned += 1
             for path in files:
                 content = contents.get(path)
@@ -1500,6 +1547,12 @@ class SkillScanner:
                             file_label=Path(rel).name,
                         ) or finding.line_content
                         result.findings.append(finding)
+        result.skill_roots = sorted(scanned_roots)
+        result.symlink_roots = [
+            SymlinkRoot(path=path, real_path=real_path)
+            for path, real_path in sorted(symlink_roots.items())
+            if path not in scanned_roots
+        ]
         return result
 
 
@@ -1561,6 +1614,57 @@ CATEGORY_RISK_TITLES_ZH = {
     "generic": "存在可疑 skill 行为",
 }
 
+CATEGORY_TYPE_LABELS = {
+    "remote_code_execution": "Remote code execution",
+    "threat_intelligence": "Malicious indicator",
+    "obfuscation": "Obfuscation / encoding",
+    "data_exfiltration": "Data exfiltration",
+    "credential_theft": "Credential theft",
+    "persistence": "Persistence",
+    "supply_chain": "Supply-chain hook",
+    "prompt_injection": "Prompt injection",
+    "social_engineering": "Social engineering",
+    "network_access": "Network access",
+    "privilege_escalation": "Privilege escalation",
+    "platform_diversion": "Platform diversion",
+    "forced_exfiltration": "Forced upload",
+    "covert_tool_handoff": "Covert handoff",
+    "host_suppression": "Host suppression",
+    "remote_workflow_exfiltration": "Remote workflow",
+    "third_party_auth": "Third-party auth",
+    "supply_chain_persistence": "Supply-chain persistence",
+    "output_driven_execution": "Output-driven execution",
+    "generic": "Suspicious behavior",
+}
+
+CATEGORY_TYPE_LABELS_ZH = {
+    "remote_code_execution": "远程代码执行",
+    "threat_intelligence": "恶意指标",
+    "obfuscation": "混淆/编码",
+    "data_exfiltration": "数据外传",
+    "credential_theft": "凭据窃取",
+    "persistence": "持久化",
+    "supply_chain": "供应链钩子",
+    "prompt_injection": "提示注入",
+    "social_engineering": "社会工程",
+    "network_access": "网络访问",
+    "privilege_escalation": "权限提升",
+    "platform_diversion": "平台导流",
+    "forced_exfiltration": "强制上传",
+    "covert_tool_handoff": "隐蔽交接",
+    "host_suppression": "宿主压制",
+    "remote_workflow_exfiltration": "远端工作流",
+    "third_party_auth": "第三方授权",
+    "supply_chain_persistence": "供应链持久化",
+    "output_driven_execution": "输出驱动执行",
+    "generic": "可疑行为",
+}
+
+EXPLANATION_MAX_CHARS = 180
+_COMMAND_IN_TICKS = re.compile(r"`([^`]+)`")
+_URL_RE = re.compile(r"https?://[^\s)\"'`<>]+")
+_AT_FILE_RE = re.compile(r"@[\w./\\-]+")
+
 UI_TEXT = {
     "en": {
         "report_title": "Skill Security Scan Report",
@@ -1573,6 +1677,7 @@ UI_TEXT = {
         "remediation": "Remediation plan",
         "skill": "Skill",
         "risk_type": "Risk type",
+        "explanation": "Note",
         "source": "Source",
         "source_excerpt": "Excerpt",
         "scanned_at": "Scan time",
@@ -1581,7 +1686,8 @@ UI_TEXT = {
         "act_now": "act immediately",
         "act_soon": "act soon",
         "review": "review",
-        "duplicates": "Duplicate copies (same content, not re-scanned)",
+        "duplicates": "Other install locations (symlink or same content, not re-scanned)",
+        "symlink_note": "symlink →",
         "duplicate_of": "same as",
         "skipped_self": "Skipped this scanner's own skill",
         "md_written": "Report written to",
@@ -1604,6 +1710,7 @@ UI_TEXT = {
         "remediation": "处置方案",
         "skill": "Skill",
         "risk_type": "风险类型",
+        "explanation": "说明",
         "source": "出处",
         "source_excerpt": "原文摘录",
         "scanned_at": "检查时间",
@@ -1612,7 +1719,8 @@ UI_TEXT = {
         "act_now": "建议立即处理",
         "act_soon": "建议尽快处理",
         "review": "建议复核",
-        "duplicates": "重复拷贝（内容相同，未再扫描）",
+        "duplicates": "其它安装位置（符号链接或内容相同，未再扫描）",
+        "symlink_note": "符号链接 →",
         "duplicate_of": "同于",
         "skipped_self": "已跳过本扫描器自身 skill",
         "md_written": "报告已写入",
@@ -1652,6 +1760,300 @@ def category_title(category: str, lang: str = "en") -> str:
     return CATEGORY_RISK_TITLES.get(category, category)
 
 
+def category_type_label(category: str, layer: str = "", lang: str = "en") -> str:
+    """Return a short risk-type label, distinct from the H4 risk title."""
+    lang = normalize_lang(lang)
+    if lang == "zh":
+        name = CATEGORY_TYPE_LABELS_ZH.get(
+            category, CATEGORY_TYPE_LABELS.get(category, category)
+        )
+    else:
+        name = CATEGORY_TYPE_LABELS.get(category, category)
+    if layer:
+        return f"{layer} · {name}"
+    return name
+
+
+def extract_effect_facts(items: list[Finding]) -> dict[str, object]:
+    """Pull commands, hosts, and flags from hit lines to describe impact."""
+    text = "\n".join(
+        finding.line_content for finding in items if finding.line_content
+    )
+    commands: list[str] = []
+    seen: set[str] = set()
+    for raw in _COMMAND_IN_TICKS.findall(text):
+        cmd = re.sub(r"\s+", " ", raw).strip()
+        if cmd and cmd not in seen and len(cmd) < 80:
+            seen.add(cmd)
+            commands.append(cmd)
+    for match in re.finditer(
+        r"(?:curl|wget)\s+[^\n]+?(?:\|\s*(?:bash|sh|zsh))?", text, re.I
+    ):
+        cmd = re.sub(r"\s+", " ", match.group(0)).strip()
+        if cmd not in seen:
+            seen.add(cmd)
+            commands.append(cmd)
+    hosts: list[str] = []
+    for url in _URL_RE.findall(text):
+        host = re.sub(r"^https?://", "", url).split("/")[0]
+        if host and host not in hosts:
+            hosts.append(host)
+    cli_names: list[str] = []
+    for cmd in commands:
+        token = cmd.split()[0] if cmd.split() else ""
+        if token and token not in {"curl", "wget", "bash", "sh", "zsh"} and token not in cli_names:
+            cli_names.append(token)
+    return {
+        "text": text,
+        "commands": commands[:3],
+        "hosts": hosts[:2],
+        "cli_names": cli_names[:2],
+        "has_notice": "_notice" in text,
+        "has_at_file": bool(_AT_FILE_RE.search(text)),
+        "has_pipe_shell": bool(re.search(r"\|\s*(?:bash|sh|zsh|powershell)", text, re.I)),
+        "has_regex_exec": bool(re.search(r"\.exec\s*\(", text)),
+        "has_oauth": bool(re.search(r"oauth|auth login", text, re.I)),
+    }
+
+
+def _join_code(values: list[str]) -> str:
+    """Join extracted tokens as inline code for an effect sentence."""
+    return "、".join(f"`{item}`" for item in values)
+
+
+def format_risk_effect(
+    skill_name: str, category: str, facts: dict[str, object], lang: str
+) -> str:
+    """Turn extracted facts into an impact sentence, not a recopied excerpt."""
+    zh = lang == "zh"
+    name = f"`{skill_name or '(unknown)'}`"
+    commands = list(facts.get("commands") or [])
+    hosts = list(facts.get("hosts") or [])
+    clis = list(facts.get("cli_names") or [])
+    cmd = _join_code(commands[:2]) if commands else ""
+    host = hosts[0] if hosts else ""
+    cli = _join_code(clis[:2]) if clis else ""
+    tool = cli or cmd or (f"`{host}`" if host else "")
+
+    if category == "remote_code_execution":
+        if zh:
+            if host and facts.get("has_pipe_shell"):
+                return (
+                    f"{name} 会从 `{host}` 下载内容并立刻在本机 shell 执行，"
+                    f"效果是把这台机器的控制权交给远端脚本。"
+                )
+            if cmd:
+                return (
+                    f"{name} 会把 {cmd} 接到本机执行；"
+                    f"一旦跑起来，来路不明的代码就拥有当前用户权限。"
+                )
+            return f"{name} 会下载并执行远端代码，本机进程会被外部脚本接管。"
+        if host and facts.get("has_pipe_shell"):
+            return (
+                f"{name} downloads from `{host}` and pipes it to a local shell, "
+                f"giving a remote script control of this machine."
+            )
+        if cmd:
+            return (
+                f"{name} would run {cmd} locally; "
+                f"untrusted code then executes with the current user's privileges."
+            )
+        return f"{name} downloads and runs remote code on this machine."
+
+    if category == "supply_chain_persistence":
+        if zh:
+            extra = f"（{cmd}）" if cmd else ""
+            notice = (
+                "CLI 输出里的 `_notice.command` 还会催促再跑安装/升级，形成反复写入。"
+                if facts.get("has_notice")
+                else ""
+            )
+            return (
+                f"{name} 一旦按原文执行{extra}，会把该 CLI 自带的 skills "
+                f"写入本机 Agent 目录；之后即使用户不再打开这个 skill，"
+                f"这些拷贝仍可能被自动加载。{notice}"
+            )
+        extra = f" ({cmd})" if cmd else ""
+        notice = (
+            " `_notice.command` in CLI output can also re-trigger install/upgrade."
+            if facts.get("has_notice")
+            else ""
+        )
+        return (
+            f"{name} would write the CLI's bundled skills into local agent "
+            f"directories{extra}; those copies can keep loading after this "
+            f"skill is no longer used.{notice}"
+        )
+
+    if category == "forced_exfiltration":
+        if zh:
+            via = f"通过 {cmd} " if cmd else ""
+            return (
+                f"{name} 会{via}把本地文件传到远端平台；"
+                f"用户界面上可能只看到「已生成/已发送」，实际副本已经离开本机。"
+            )
+        via = f" via {cmd}" if cmd else ""
+        return (
+            f"{name} uploads local files to a remote platform{via}; "
+            f"the user may only see “generated/sent” while a copy has left the machine."
+        )
+
+    if category == "remote_workflow_exfiltration":
+        if zh:
+            attach = "用 `@文件路径` 自动附带本地文件，" if facts.get("has_at_file") else ""
+            via = f"经 {cmd} " if cmd else ""
+            return (
+                f"{name} 会{via}{attach}把本地任务送进远端会话/工作流，"
+                f"文件内容会离开本机进入对方平台。"
+            )
+        attach = "auto-attaches local `@path` files and " if facts.get("has_at_file") else ""
+        via = f" via {cmd}" if cmd else ""
+        return (
+            f"{name}{via} {attach}sends local work into a remote session, "
+            f"so file contents leave this machine."
+        ).replace("  ", " ")
+
+    if category == "platform_diversion":
+        if zh:
+            dest = tool or "第三方 CLI"
+            return (
+                f"{name} 会在用户只是说「开发/改代码/做产品」时把任务转给{dest}，"
+                f"当前 Agent 不再自己做完，工作流被切到外部平台。"
+            )
+        dest = tool or "a third-party CLI"
+        return (
+            f"{name} hijacks ordinary coding/product requests onto {dest}, "
+            f"so the host agent no longer finishes the work itself."
+        )
+
+    if category == "covert_tool_handoff":
+        dest = tool or ("外部工具" if zh else "an external tool")
+        if zh:
+            return (
+                f"{name} 会在用户没有点名{dest}时就把工作交出去；"
+                f"用户以为还在当前 Agent 里处理，实际已换到另一条工具链。"
+            )
+        return (
+            f"{name} hands work to {dest} without the user naming it, "
+            f"so the task leaves the host agent’s own path."
+        )
+
+    if category == "host_suppression":
+        if zh:
+            dest = tool or "指定的外部 CLI"
+            return (
+                f"{name} 禁止回退到宿主 Agent 自己的能力，必须把{dest}路径跑通；"
+                f"用户很难退出这条导流，一旦 CLI 失败任务也会被卡住。"
+            )
+        dest = tool or "the vendor CLI"
+        return (
+            f"{name} forbids falling back to the host agent, forcing {dest}; "
+            f"the user cannot easily leave that path if the CLI fails."
+        )
+
+    if category == "output_driven_execution":
+        if zh:
+            example = f"例如 {cmd}，" if cmd and "_notice" not in cmd else ""
+            return (
+                f"{name} 会把 CLI 输出里的建议命令（`_notice.command` 等）"
+                f"当成必须补做的步骤，{example}等于让远端输出直接改本机环境。"
+            )
+        example = f" such as {cmd}" if cmd else ""
+        return (
+            f"{name} treats suggested commands in CLI output "
+            f"(`_notice.command`) as required follow-up{example}, "
+            f"so remote output can change this machine."
+        )
+
+    if category == "third_party_auth":
+        if zh:
+            via = f"{cmd} " if cmd else ""
+            return (
+                f"{name} 会拉起 {via}第三方登录/OAuth；"
+                f"授权可能在后台完成，本机因此留下对方账号的 token。"
+            )
+        via = f"{cmd} " if cmd else ""
+        return (
+            f"{name} starts {via}third-party login/OAuth; "
+            f"the grant may finish in the background and leave a local token."
+        )
+
+    if category == "obfuscation":
+        if facts.get("has_regex_exec"):
+            if zh:
+                return (
+                    f"{name} 命中的是脚本里的正则解析（`.exec`），"
+                    f"更像在拆 HTTP/Markdown，不一定是隐藏载荷；需要对照上下文判断。"
+                )
+            return (
+                f"{name} matched regex `.exec` parsing (HTTP/Markdown-style), "
+                f"which is not necessarily a hidden payload — review the surrounding code."
+            )
+        if zh:
+            return (
+                f"{name} 出现编码/混淆写法，可能用来藏命令或地址；"
+                f"直接阅读原文不容易看出真正会执行什么。"
+            )
+        return (
+            f"{name} uses encoding/obfuscation that can hide commands or hosts; "
+            f"the real action is easy to miss when reading the source."
+        )
+
+    if category == "threat_intelligence":
+        if zh:
+            via = f"`{host}` " if host else (f"{cmd} " if cmd else "")
+            return f"{name} 命中已知恶意指标 {via}，按原文连接或下载即可能接入攻击方基础设施。"
+        via = f"`{host}` " if host else (f"{cmd} " if cmd else "")
+        return (
+            f"{name} matches a known-bad indicator {via}; "
+            f"following the source can reach attacker infrastructure."
+        )
+
+    if category in {"data_exfiltration", "credential_theft"}:
+        if zh:
+            via = f"用 {cmd} " if cmd else ""
+            what = "凭据/密钥" if category == "credential_theft" else "敏感文件或目录"
+            return f"{name} 会{via}读取或外传{what}，相关秘密可能离开本机。"
+        via = f" via {cmd}" if cmd else ""
+        what = "credentials/secrets" if category == "credential_theft" else "sensitive files"
+        return f"{name} reads or sends {what}{via}, so secrets may leave this machine."
+
+    if category == "prompt_injection":
+        if zh:
+            return (
+                f"{name} 用越狱/覆盖系统规则的话术改变 Agent 行为，"
+                f"后续工具调用可能不再遵守原来的安全边界。"
+            )
+        return (
+            f"{name} uses jailbreak/override language that can make the agent "
+            f"ignore its original safety constraints."
+        )
+
+    if zh:
+        via = f"（涉及 {tool}）" if tool else ""
+        return f"{name} 按原文执行后会产生超出表面描述的副作用{via}，需要结合出处判断影响范围。"
+    via = f" involving {tool}" if tool else ""
+    return (
+        f"{name} has side effects beyond the surface wording{via}; "
+        f"check the source to see what actually changes."
+    )
+
+
+def risk_explanation(
+    skill_name: str, items: list[Finding], lang: str = "en"
+) -> str:
+    """Explain the practical effect of the hits, without recopying the excerpt."""
+    lang = normalize_lang(lang)
+    shown = unique_findings_by_location(items)
+    if not shown:
+        return ""
+    category = shown[0].category
+    note = format_risk_effect(skill_name, category, extract_effect_facts(shown), lang)
+    if len(note) > EXPLANATION_MAX_CHARS * 2:
+        note = note[: EXPLANATION_MAX_CHARS * 2 - 1] + "…"
+    return note
+
+
 def severity_name(severity: Severity, lang: str = "en") -> str:
     """Return a localized severity name."""
     return ui(lang)["severity"][str(severity)]
@@ -1670,6 +2072,8 @@ class RiskSummary:
     count: int
     detectors: list[str] = field(default_factory=list)
     file_refs: list[str] = field(default_factory=list)
+    risk_type: str = ""
+    explanation: str = ""
 
     def to_dict(self) -> dict:
         """Serialize the risk summary for JSON output."""
@@ -1679,6 +2083,8 @@ class RiskSummary:
             "category": self.category,
             "skill_name": self.skill_name,
             "statement": self.statement,
+            "risk_type": self.risk_type,
+            "explanation": self.explanation,
             "source_excerpt": self.source_excerpt,
             "file_refs": self.file_refs,
             "count": self.count,
@@ -2162,6 +2568,8 @@ def build_risk_summaries(
                 count=len(items),
                 detectors=detectors,
                 file_refs=file_refs,
+                risk_type=category_type_label(category, top.layer, lang),
+                explanation=risk_explanation(skill_name, items, lang),
             )
         )
 
@@ -2189,10 +2597,16 @@ def print_overview(
         mark = f"{SEVERITY_EMOJI[severity]} " if use_emoji else ""
         count_bits.append(f"{mark}{name} {counts[severity.name]}")
     print(f"- **{text['severity_counts']}**{sep}{' · '.join(count_bits)}")
-    if result.skill_roots:
+    if result.skill_roots or result.symlink_roots:
         print(f"- **{text['roots']}**{sep}")
         for root in result.skill_roots:
             print(f"  - `{root}`")
+        for link in result.symlink_roots:
+            note = text["symlink_note"]
+            if lang == "zh":
+                print(f"  - `{link.path}`（{note} `{link.real_path}`）")
+            else:
+                print(f"  - `{link.path}` ({note} `{link.real_path}`)")
     if result.skipped_self:
         print(f"- **{text['skipped_self']}**{sep}")
         for path in result.skipped_self:
@@ -2222,17 +2636,24 @@ def unique_findings_by_location(items: list[Finding]) -> list[Finding]:
 
 def print_finding_fields(
     skill_name: str,
-    risk_title: str,
+    category: str,
     items: list[Finding],
     *,
     lang: str = "en",
 ) -> None:
-    """Print skill, risk type, clickable sources, and fenced excerpts."""
+    """Print skill, short risk type, content-based note, sources, and excerpts."""
     text = ui(lang)
     sep = "：" if lang == "zh" else ": "
     shown = unique_findings_by_location(items)
+    layer = shown[0].layer if shown else ""
     print(f"- **{text['skill']}**{sep}`{skill_name}`")
-    print(f"- **{text['risk_type']}**{sep}{risk_title}")
+    print(
+        f"- **{text['risk_type']}**{sep}"
+        f"{category_type_label(category, layer, lang)}"
+    )
+    note = risk_explanation(skill_name, shown, lang)
+    if note:
+        print(f"- **{text['explanation']}**{sep}{note}")
     if len(shown) == 1:
         finding = shown[0]
         print(
@@ -2288,7 +2709,7 @@ def print_findings_section(
             title = category_title(category, lang)
             print(f"#### {title}")
             print()
-            print_finding_fields(skill_name, title, shown, lang=lang)
+            print_finding_fields(skill_name, category, shown, lang=lang)
 
 
 def print_remediation(
@@ -2386,6 +2807,22 @@ def write_markdown_report(path: Path, body: str) -> Optional[Path]:
         return None
 
 
+def should_print_stdout_report(args: argparse.Namespace, md_path: Optional[Path]) -> bool:
+    """Return whether the full markdown report should also go to stdout.
+
+    Agent/tool captures are not a TTY and often truncate long stdout. When a
+    report file was written, skip the duplicate dump unless the user asked
+    to print it.
+    """
+    if getattr(args, "quiet", False):
+        return False
+    if getattr(args, "force_print", False):
+        return True
+    if md_path is not None and not sys.stdout.isatty():
+        return False
+    return True
+
+
 def parse_severity(value: str) -> Severity:
     """Parse a severity name into a Severity enum."""
     try:
@@ -2449,6 +2886,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Do not write a markdown report file",
     )
     p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Do not print the full report to stdout (file / stderr path only)",
+    )
+    p.add_argument(
+        "--print",
+        dest="force_print",
+        action="store_true",
+        help="Always print the full report to stdout, even when a markdown file was written",
+    )
+    p.add_argument(
         "--ioc-db",
         help="Path to an alternate IOC JSON database",
     )
@@ -2501,6 +2949,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "skills_scanned": result.skills_scanned,
             "files_scanned": result.files_scanned,
             "skill_roots": result.skill_roots,
+            "symlink_roots": [s.to_dict() for s in result.symlink_roots],
             "skill_paths": result.skill_paths,
             "skipped_self": result.skipped_self,
             "duplicate_copies": [d.to_dict() for d in result.duplicate_copies],
@@ -2513,7 +2962,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "findings": [f.to_dict() for f in result.findings],
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
+    elif should_print_stdout_report(args, md_path):
         print_report(
             result,
             use_color=not args.no_color and sys.stdout.isatty(),

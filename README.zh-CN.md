@@ -41,7 +41,7 @@ npx skills add RJiazhen/skill-security-scan -g -y -a cursor
 
 > 检查一下有没有恶意 skill / 技能安全扫描。
 
-Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描。**默认直接输出完整 Markdown 报告**，并写入 `./skill-security-scan-report.md`（用户明确不要文件、或环境无法创建 md 时则只输出到终端）：总体检查情况、按级别列出的风险项（含可点击出处与原文摘录），以及带 `bash` 代码块的**处置方案**（如隔离 `mv`、复扫）。Agent 应原样转述报告，只在末尾提示写入的文件路径。
+Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描。**默认直接输出完整 Markdown 报告**，并写入 `./skill-security-scan-report.md`（用户明确不要文件、或环境无法创建 md 时则只输出到终端）：总体检查情况、按级别列出的风险项（含可点击出处与原文摘录），以及带 `bash` 代码块的**处置方案**（如隔离 `mv`、复扫）。脚本只标出候选语句；Agent 需按 skill 规则复核（宿主内置 vs 外部去向、说明写具体效果）后再呈现报告，只在末尾提示写入的文件路径。
 
 用中文交流时，Agent 应以 **中文报告** 呈现结果（扫描时加 `--lang zh`）。
 
@@ -94,7 +94,7 @@ Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描
 | HIGH | `RemoteWorkflowExfiltrationDetector` | 远端 message 自动附带本地源码文件 |
 | HIGH | `OutputDrivenCommandDetector` | 执行 CLI 输出给出的修复命令 |
 | HIGH | `ThirdPartyAuthHandoffDetector` | 后台第三方账号授权 |
-| HIGH | `CovertToolHandoffDetector` | 用户未点名即路由到外部工具 |
+| HIGH | `CovertToolHandoffDetector` | 候选：未点名即路由的文案（由 Agent 确认是否外部去向） |
 | HIGH | `HostCapabilitySuppressionDetector` | 禁止回退到宿主能力 |
 
 同一 skill 上 **多个 L2/L3 同时出现** 时，即使没有经典后门，也应高度警惕。
@@ -122,7 +122,7 @@ Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描
 | PlatformDiversionDetector | L2 | 「软件开发」宽触发 → 第三方 CLI |
 | ForcedUploadDetector | L2 | 强制 / 自动上传本地文件 |
 | RemoteWorkflowExfiltrationDetector | L2 | 远端 message 工作流附带本地文件 |
-| CovertToolHandoffDetector | L2 | 用户未点名却把工作交给外部工具 |
+| CovertToolHandoffDetector | L2 | 候选：未点名即路由的文案（复核去向） |
 | HostCapabilitySuppressionDetector | L2 | 禁止使用宿主自带能力 |
 | ThirdPartyAuthHandoffDetector | L2 | 第三方账号授权（尤其后台） |
 | SilentSkillInstallDetector | L3 | 静默安装 skill 到 agents |
@@ -140,6 +140,9 @@ Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描
 ```bash
 # 扫本机（默认同时写入 ./skill-security-scan-report.md）
 python3 skills/skill-security-scan/scripts/scan.py --no-color
+
+# Agent/CI：只写文件，避免终端捕获把长报告截断
+python3 skills/skill-security-scan/scripts/scan.py --no-color --quiet
 
 # 只要终端输出、不写 md（用户明确不要文件时）
 python3 skills/skill-security-scan/scripts/scan.py --no-color --no-md

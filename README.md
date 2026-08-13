@@ -41,7 +41,7 @@ Or more casually:
 
 > Check for malicious skills / run a skill security scan.
 
-The agent follows this skill’s workflow, auto-discovers local skill directories, and by default returns a **full markdown report** (also written to `./skill-security-scan-report.md` unless the user opts out or the environment cannot create the file): scan overview, findings grouped by severity with clickable source links and excerpts, then a **remediation plan** with fenced shell commands (quarantine `mv`, re-scan) when paths are known. The agent should paste that report as-is and only mention the written file path at the end.
+The agent follows this skill’s workflow, auto-discovers local skill directories, and by default returns a **full markdown report** (also written to `./skill-security-scan-report.md` unless the user opts out or the environment cannot create the file): scan overview, findings grouped by severity with clickable source links and excerpts, then a **remediation plan** with fenced shell commands (quarantine `mv`, re-scan) when paths are known. The script only marks candidate language; the agent reviews each hit (host built-in vs external destination, concrete 说明) before presenting the report, and only mentions the written file path at the end.
 
 When the user chats in Chinese, the agent should present the **final report in Chinese** (`--lang zh`). English chats use the default English report.
 
@@ -94,7 +94,7 @@ For a diversion-style sample, the agent report may include:
 | HIGH | `RemoteWorkflowExfiltrationDetector` | Remote messages auto-attach local source files |
 | HIGH | `OutputDrivenCommandDetector` | Runs repair commands emitted by CLI output |
 | HIGH | `ThirdPartyAuthHandoffDetector` | Background vendor account authorization |
-| HIGH | `CovertToolHandoffDetector` | Routes work to an external tool without the user naming it |
+| HIGH | `CovertToolHandoffDetector` | Candidate: route-without-naming language (agent confirms external destination) |
 | HIGH | `HostCapabilitySuppressionDetector` | Forbids falling back to host capabilities |
 
 When **multiple L2/L3 signals appear on the same skill**, treat it as high risk even without a classic backdoor.
@@ -122,7 +122,7 @@ Common auto-discovered paths:
 | PlatformDiversionDetector | L2 | Broad “software development” trigger → third-party CLI |
 | ForcedUploadDetector | L2 | Forced / automatic upload of local files |
 | RemoteWorkflowExfiltrationDetector | L2 | Remote message workflows that pull in local files |
-| CovertToolHandoffDetector | L2 | Hands work to external tools without user naming them |
+| CovertToolHandoffDetector | L2 | Candidate: route-without-naming language (review destination) |
 | HostCapabilitySuppressionDetector | L2 | Blocks host built-in capabilities |
 | ThirdPartyAuthHandoffDetector | L2 | Vendor account authorization (especially background) |
 | SilentSkillInstallDetector | L3 | Silent skill install into agents |
@@ -140,6 +140,9 @@ Most users **do not** need this. Use it for CI, local development, or when the a
 ```bash
 # Full detailed report (default; also writes ./skill-security-scan-report.md)
 python3 skills/skill-security-scan/scripts/scan.py --no-color
+
+# Agent/CI: write the file only (avoid truncated stdout captures)
+python3 skills/skill-security-scan/scripts/scan.py --no-color --quiet
 
 # Stdout only (no markdown file)
 python3 skills/skill-security-scan/scripts/scan.py --no-color --no-md
