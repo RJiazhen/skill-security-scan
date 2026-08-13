@@ -41,7 +41,9 @@ npx skills add RJiazhen/skill-security-scan -g -y -a cursor
 
 > 检查一下有没有恶意 skill / 技能安全扫描。
 
-Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描，**优先给出风险语句摘要**（CRITICAL / HIGH / MEDIUM / LOW），再按需展开明细。
+Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描。**默认直接输出完整 Markdown 报告**，并写入 `./skill-security-scan-report.md`（用户明确不要文件、或环境无法创建 md 时则只输出到终端）：总体检查情况、按级别列出的风险项（含可点击出处与原文摘录），以及带 `bash` 代码块的**处置方案**（如隔离 `mv`、复扫）。Agent 应原样转述报告，只在末尾提示写入的文件路径。
+
+用中文交流时，Agent 应以 **中文报告** 呈现结果（扫描时加 `--lang zh`）。
 
 若只要摘要：
 
@@ -97,7 +99,7 @@ Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描
 
 同一 skill 上 **多个 L2/L3 同时出现** 时，即使没有经典后门，也应高度警惕。
 
-处置建议概要：停止使用 → 移出 agent 加载路径 → 检查 CLI 是否会自动重装 → 必要时轮换密钥 → 再扫确认。详见 [`references/remediation.md`](skills/skill-security-scan/references/remediation.md)。
+处置建议概要：停止使用 → 移出 agent 加载路径 → 检查 CLI 是否会自动重装 → 必要时轮换密钥 → 再扫确认。扫描报告末尾的 **处置方案** 会按告警类别给出步骤，并在已知路径时打印可复制执行的隔离/复扫命令。详见 [`references/remediation.md`](skills/skill-security-scan/references/remediation.md)。
 
 ---
 
@@ -136,20 +138,26 @@ Agent 会按本 skill 的工作流自动发现本机 skill 目录并运行扫描
 一般用户**不需要**这一步；给 CI、二次开发或 Agent 不可用时备用。
 
 ```bash
-# 扫本机
+# 扫本机（默认同时写入 ./skill-security-scan-report.md）
 python3 skills/skill-security-scan/scripts/scan.py --no-color
 
-# 只看风险语句摘要
-python3 skills/skill-security-scan/scripts/scan.py --summary-only --severity medium --no-color
+# 只要终端输出、不写 md（用户明确不要文件时）
+python3 skills/skill-security-scan/scripts/scan.py --no-color --no-md
+
+# 完整中文详细报告（默认，不要加 --summary-only）
+python3 skills/skill-security-scan/scripts/scan.py --no-color --lang zh
+
+# 只要风险语句摘要（用户明确只要摘要时）
+python3 skills/skill-security-scan/scripts/scan.py --summary-only --severity medium --no-color --lang zh
 
 # 扫单个目录
-python3 skills/skill-security-scan/scripts/scan.py --path /path/to/skill --no-color
+python3 skills/skill-security-scan/scripts/scan.py --path /path/to/skill --no-color --lang zh
 
-# JSON（含 risk_summaries）
-python3 skills/skill-security-scan/scripts/scan.py --json --severity medium --no-color
+# JSON（含 risk_summaries；statement 随 --lang）
+python3 skills/skill-security-scan/scripts/scan.py --json --severity medium --no-color --lang zh
 
 # 关闭 emoji（CI / 纯文本日志）
-python3 skills/skill-security-scan/scripts/scan.py --summary-only --no-emoji --no-color
+python3 skills/skill-security-scan/scripts/scan.py --no-emoji --no-color --lang zh
 ```
 
 退出码：`0` 干净 · `1` low/medium · `2` high · `3` critical

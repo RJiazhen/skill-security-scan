@@ -38,13 +38,16 @@ From this skill's install location (adjust if symlinked elsewhere):
 python3 skills/skill-security-scan/scripts/scan.py --no-color
 ```
 
-If this skill is installed globally under Cursor:
+If this skill is installed globally (Cursor agent / skills CLI):
 
 ```bash
-python3 ~/.cursor/skills/skill-security-scan/scripts/scan.py --no-color
+python3 ~/.agents/skills/skill-security-scan/scripts/scan.py --no-color --lang zh
 ```
 
-Auto-discovers skills under:
+Also try `~/.cursor/skills/skill-security-scan/...` if present on older layouts.
+
+Auto-discovers skills under (skips this scanner's own package; identical
+copies under multiple agent roots are hashed and scanned once):
 
 - `~/.cursor/skills`, project `.cursor/skills`
 - `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`
@@ -68,50 +71,146 @@ python3 scripts/scan.py --ioc-db /path/to/ioc_database.json
 
 ### 3. Report to the user
 
-Prefer the scanner’s **RISK STATEMENT SUMMARY** (or `--summary-only` / JSON `risk_summaries`).
-Present it first, then details if the user wants them.
+**Default = full report.** Do **not** pass `--summary-only` unless the user
+explicitly asks for a short / summary-only view.
 
-```markdown
-## Audit summary
-- Skills scanned: N
-- Files scanned: N
-- 🔴 CRITICAL / 🟠 HIGH / 🟡 MEDIUM / 🔵 LOW: n / n / n / n
+**Match the user's language.** If the user writes in Chinese, run with `--lang zh`.
+English chats use `--lang en` or omit it.
 
-## Risk statement summary
-For each item (deduped by skill + category):
-- 🔴/🟠/🟡/🔵 [SEVERITY] skill-name
-  - ⚠️ Risk: <one-sentence risk statement>
-  - 📝 Evidence: <short quote from SKILL.md / script>
-  - Category / layer / detectors
+**Output the scanner report as-is.** You may run the scan yourself or via a
+sub-agent. Paste the markdown report body with no extra narration — no
+“完整 N 条命中已写入…”, no “下面按 skill 列出”, no recap before the `#` title.
 
-## Critical & high (action required)
-- Only if the user asks for detail: skill · detector · file:line · action
+After the report body, add **only** one line with the written file path
+(stderr: `报告已写入: …` / `Report written to: …`):
 
-## Medium & low
-- Brief list; note likely false positives
+报告已写入：`/abs/path/skill-security-scan-report.md`
+
+Hard rules:
+
+1. Default CLI (Chinese chat):
+   `python3 ~/.agents/skills/skill-security-scan/scripts/scan.py --no-color --lang zh`
+   (no `--summary-only`; default `--severity low` so MEDIUM/LOW are included).
+   The scanner **writes** `./skill-security-scan-report.md` unless the user says
+   not to, or the environment cannot create the file (then stdout only).
+   Pass `--no-md` only when the user explicitly does not want a file
+   (不要写文件 / 只输出到终端). Use `--md PATH` to choose another location.
+2. Use `--summary-only` **only** when the user asks for 摘要 / summary only.
+3. Relay the scanner markdown **verbatim**: `#` title (name + scan time),
+   `## 总体检查情况`, `## 风险项` with `###` severity and `####` risk-item
+   headings, then `## 处置方案`. Do not rename headings or drop fields.
+4. Keep **Skill** / **风险类型** / **出处** / **原文摘录** (or the English
+   equivalents). Never call the risk type a「检测器」/ detector. Preserve
+   clickable `出处` links (`file://…#L18`) and ` ```md ` excerpt fences.
+   Do not add `L18 |` prefixes or rewrite excerpts.
+5. Keep `处置方案` / `Remediation plan` **verbatim**, including `###` sub-plans
+   and ` ```bash ` command fences.
+
+Chinese conversation shape (`--lang zh`, default full report):
+
+````markdown
+# Skill 安全扫描报告 · 2026-08-13 21:05
+
+## 总体检查情况
+- **检查时间**：2026-08-13 21:05
+- **Skill 数**：N
+- **文件数**：N
+- **风险级别统计**：🔴 严重 n · 🟠 高 n · 🟡 中 n · 🔵 低 n
+
+## 风险项
+
+### 严重
+
+#### <风险项名称>
+
+- **Skill**：`skill-name`
+- **风险类型**：<风险项名称>
+- **出处**：[ /path/to/SKILL.md:18 ](file:///path/to/SKILL.md#L18)
+- **原文摘录**：
+
+```md
+<命中原文>
 ```
 
-Keep emoji severity markers in chat replies for readability (same mapping as the CLI report).
-Use `--no-emoji` only when the user asks for plain text / CI logs.
+## 处置方案
 
-Call out **L2/L3** risk statements explicitly (diversion, forced upload, silent install,
-remote workflow, output-driven commands) — these are often missed by malware-only scanners.
+### skill-name（严重 — 建议立即处理）
 
-Example CLI for summary-first reporting:
+1. 隔离该 skill
 
 ```bash
-python3 scripts/scan.py --summary-only --severity medium --no-color
-python3 scripts/scan.py --json --severity high
+mkdir -p ~/quarantine/skills
+mv /path/to/skill ~/quarantine/skills/
+```
+````
+
+English conversation shape (default full report):
+
+````markdown
+# Skill Security Scan Report · 2026-08-13 21:05
+
+## Scan overview
+…
+
+## Findings
+
+### CRITICAL
+
+#### <risk item name>
+
+- **Skill**: `skill-name`
+- **Risk type**: <risk item name>
+- **Source**: [ /path/to/SKILL.md:18 ](file:///path/to/SKILL.md#L18)
+- **Excerpt**:
+
+```md
+<hit line>
 ```
 
-### 4. Remediate
+## Remediation plan
+
+### skill-name (CRITICAL — act immediately)
+
+1. Quarantine this skill
+
+```bash
+mkdir -p ~/quarantine/skills
+mv /path/to/skill ~/quarantine/skills/
+```
+````
+
+Keep emoji severity markers in chat replies (same mapping as the CLI).
+Use `--no-emoji` only for plain text / CI logs.
+
+Example CLI:
+
+```bash
+# Default: full Chinese report + ./skill-security-scan-report.md
+python3 ~/.agents/skills/skill-security-scan/scripts/scan.py --no-color --lang zh
+
+# No markdown file (only when the user asks)
+python3 ~/.agents/skills/skill-security-scan/scripts/scan.py --no-color --lang zh --no-md
+
+# Summary only when the user asks
+python3 ~/.agents/skills/skill-security-scan/scripts/scan.py --summary-only --no-color --lang zh
+
+python3 scripts/scan.py --json --lang zh
+```
+
+### 4. Remediate (include at end of the report)
+
+Always end the user-facing report with the scanner’s **处置方案** /
+**Remediation plan** section (also in JSON `remediation`). Keep numbered
+steps and ` ```bash ` fences when skill paths are known. Source quotes use
+the `原文摘录` / `Excerpt` block (`source_excerpt` in JSON).
 
 For CRITICAL/HIGH:
 
-1. Quarantine or remove the skill directory
+1. Quarantine or remove the skill directory (use the printed `mv` commands when present)
 2. Rotate credentials if exfiltration or credential theft was flagged
 3. Check whether a CLI auto-reinstalled skills into agent directories
-4. See [references/remediation.md](references/remediation.md)
+4. Re-scan at `--severity high` to confirm cleanup
+5. See [references/remediation.md](references/remediation.md)
 
 ## Detector cheat sheet
 

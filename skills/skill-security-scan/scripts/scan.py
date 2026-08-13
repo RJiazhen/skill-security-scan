@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import math
 import os
 import re
+import shlex
 import sys
+from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
 from typing import Iterable, Optional
@@ -53,12 +57,28 @@ class Finding:
     description: str
     confidence: int
     skill_name: str = ""
+    skill_path: str = ""
 
     def to_dict(self) -> dict:
         """Serialize the finding for JSON output."""
         d = asdict(self)
         d["severity"] = str(self.severity)
         return d
+
+
+# Hit-line only; surrounding context is omitted to keep reports short.
+EVIDENCE_CONTEXT_BEFORE = 0
+EVIDENCE_CONTEXT_AFTER = 0
+EVIDENCE_MAX_LINE_CHARS = 220
+# Max distinct excerpts shown per risk-summary category.
+EVIDENCE_SUMMARY_LIMIT = 3
+DEFAULT_MD_REPORT_NAME = "skill-security-scan-report.md"
+SCAN_TIME_FORMAT = "%Y-%m-%d %H:%M"
+
+
+def format_scan_time(when: Optional[datetime] = None) -> str:
+    """Return a local scan timestamp for report headings."""
+    return (when or datetime.now()).strftime(SCAN_TIME_FORMAT)
 
 
 # ─── IOC database ────────────────────────────────────────────────────────────
@@ -155,6 +175,47 @@ MAX_FILE_SIZE = 1_000_000
 MAX_FILES_PER_SKILL = 1000
 SKIP_FILE_NAMES = {"ioc_database.json"}
 SCANNER_SELF_MARKER = "skill-security-scan:scanner"
+SELF_SKILL_NAMES = {"skill-security-scan"}
+
+
+def is_self_scanner_skill(skill_dir: Path, skill_name: str = "") -> bool:
+    """Return True when this directory is the scanner's own skill package."""
+    name = skill_name or skill_dir.name
+    if name in SELF_SKILL_NAMES:
+        return True
+    scan_py = skill_dir / "scripts" / "scan.py"
+    if not scan_py.is_file():
+        return False
+    try:
+        head = scan_py.read_text(encoding="utf-8", errors="replace")[:500]
+    except OSError:
+        return False
+    return SCANNER_SELF_MARKER in head
+
+
+def skill_content_fingerprint(
+    skill_dir: Path, files: list[Path]
+) -> tuple[str, dict[Path, str]]:
+    """Hash skill file contents (relative paths + bytes) and return decoded text.
+
+    Used to skip re-scanning identical copies installed under multiple agent roots.
+    """
+    digest = hashlib.sha256()
+    contents: dict[Path, str] = {}
+    for path in sorted(files, key=lambda p: str(p)):
+        try:
+            rel = str(path.resolve().relative_to(skill_dir.resolve()))
+        except ValueError:
+            rel = path.name
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        digest.update(rel.encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(data).digest())
+        contents[path] = data.decode("utf-8", errors="replace")
+    return digest.hexdigest(), contents
 
 
 class SkillDiscovery:
@@ -236,6 +297,8 @@ class SkillDiscovery:
                     continue
                 resolved = child.resolve()
                 if resolved in seen:
+                    continue
+                if is_self_scanner_skill(resolved, child.name):
                     continue
                 # Prefer directories that look like skills (SKILL.md) but include all
                 # immediate children of known skill roots.
@@ -319,7 +382,7 @@ class BaseDetector:
             category=category or self.category,
             file_path=file_path,
             line_number=line_number,
-            line_content=line.strip()[:200],
+            line_content=line.strip()[:EVIDENCE_MAX_LINE_CHARS],
             description=description,
             confidence=confidence,
         )
@@ -1310,6 +1373,23 @@ class SkillPathWriteDetector(BaseDetector):
 
 
 @dataclass
+class DuplicateCopy:
+    """A skill that matches an already-scanned copy by content hash."""
+
+    name: str
+    scanned_path: str
+    copy_path: str
+
+    def to_dict(self) -> dict:
+        """Serialize the duplicate-copy record for JSON output."""
+        return {
+            "name": self.name,
+            "scanned_path": self.scanned_path,
+            "copy_path": self.copy_path,
+        }
+
+
+@dataclass
 class ScanResult:
     """Aggregated scan output across all skills."""
 
@@ -1317,6 +1397,10 @@ class ScanResult:
     files_scanned: int = 0
     findings: list[Finding] = field(default_factory=list)
     skill_roots: list[str] = field(default_factory=list)
+    skill_paths: dict[str, str] = field(default_factory=dict)
+    skipped_self: list[str] = field(default_factory=list)
+    duplicate_copies: list[DuplicateCopy] = field(default_factory=list)
+    scanned_at: str = ""
 
     def counts_by_severity(self) -> dict[str, int]:
         """Count findings per severity level."""
@@ -1367,24 +1451,54 @@ class SkillScanner:
         ]
 
     def scan_skills(self, skills: list[dict]) -> ScanResult:
-        """Scan a list of skill records and aggregate findings."""
-        result = ScanResult()
-        result.skills_scanned = len(skills)
+        """Scan skill records, skipping this scanner and identical copies."""
+        result = ScanResult(scanned_at=format_scan_time())
         roots = sorted({s.get("source_root", "") for s in skills if s.get("source_root")})
         result.skill_roots = [r for r in roots if r]
+        seen_hashes: dict[str, tuple[str, str]] = {}
 
         for skill in skills:
             name = skill["name"]
-            for path in skill["files"]:
+            skill_dir = Path(skill.get("path") or "")
+            skill_path = str(skill_dir) if skill_dir else ""
+            if skill_dir and is_self_scanner_skill(skill_dir, name):
+                result.skipped_self.append(skill_path or name)
+                continue
+            files = list(skill.get("files") or [])
+            fingerprint, contents = skill_content_fingerprint(skill_dir, files)
+            if fingerprint and fingerprint in seen_hashes:
+                first_name, first_path = seen_hashes[fingerprint]
+                result.duplicate_copies.append(
+                    DuplicateCopy(
+                        name=name or first_name,
+                        scanned_path=first_path,
+                        copy_path=skill_path,
+                    )
+                )
+                continue
+            if fingerprint:
+                seen_hashes[fingerprint] = (name, skill_path)
+            if skill_path:
+                result.skill_paths.setdefault(name, skill_path)
+            result.skills_scanned += 1
+            for path in files:
+                content = contents.get(path)
+                if content is None:
+                    try:
+                        content = path.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
                 result.files_scanned += 1
-                try:
-                    content = path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
                 rel = str(path)
                 for detector in self.detectors:
                     for finding in detector.scan_file(content, rel):
                         finding.skill_name = name
+                        finding.skill_path = skill_path
+                        finding.line_content = build_evidence_excerpt(
+                            content,
+                            finding.line_number,
+                            file_label=Path(rel).name,
+                        ) or finding.line_content
                         result.findings.append(finding)
         return result
 
@@ -1399,12 +1513,6 @@ SEVERITY_EMOJI = {
     Severity.HIGH: "🟠",
     Severity.MEDIUM: "🟡",
     Severity.LOW: "🔵",
-}
-
-LAYER_EMOJI = {
-    "L1": "💣",
-    "L2": "🎭",
-    "L3": "📦",
 }
 
 CATEGORY_RISK_TITLES = {
@@ -1430,6 +1538,124 @@ CATEGORY_RISK_TITLES = {
     "generic": "Suspicious skill behavior",
 }
 
+CATEGORY_RISK_TITLES_ZH = {
+    "remote_code_execution": "通过「下载并执行」实现远程代码执行",
+    "threat_intelligence": "命中已知恶意指标（IOC）",
+    "obfuscation": "存在混淆或编码载荷特征",
+    "data_exfiltration": "存在敏感数据收集/上传特征",
+    "credential_theft": "存在凭据或密钥访问特征",
+    "persistence": "存在持久化/开机自启类机制",
+    "supply_chain": "安装钩子等供应链代码执行风险",
+    "prompt_injection": "存在提示注入/越狱类文案",
+    "social_engineering": "存在社工式命名或话术包装",
+    "network_access": "出现非预期的网络访问能力",
+    "privilege_escalation": "存在提权相关操作",
+    "platform_diversion": "将正常工作流静默导流到第三方平台",
+    "forced_exfiltration": "强制把本地内容上传到远端平台",
+    "covert_tool_handoff": "在用户未明确点名时把工作交给外部工具/平台",
+    "host_suppression": "禁止回退到宿主 Agent 自身能力",
+    "remote_workflow_exfiltration": "把本地文件/任务送入远端平台工作流",
+    "third_party_auth": "引导进行第三方账号授权/OAuth",
+    "supply_chain_persistence": "静默安装 skill 或写入 agent 目录形成持久化",
+    "output_driven_execution": "按 CLI/工具输出中的建议命令执行（输出驱动）",
+    "generic": "存在可疑 skill 行为",
+}
+
+UI_TEXT = {
+    "en": {
+        "report_title": "Skill Security Scan Report",
+        "overview": "Scan overview",
+        "findings_section": "Findings",
+        "skills": "Skills scanned",
+        "files": "Files scanned",
+        "roots": "Scan roots",
+        "clean": "No security issues detected.",
+        "remediation": "Remediation plan",
+        "skill": "Skill",
+        "risk_type": "Risk type",
+        "source": "Source",
+        "source_excerpt": "Excerpt",
+        "scanned_at": "Scan time",
+        "severity_counts": "Severity totals",
+        "none": "(none)",
+        "act_now": "act immediately",
+        "act_soon": "act soon",
+        "review": "review",
+        "duplicates": "Duplicate copies (same content, not re-scanned)",
+        "duplicate_of": "same as",
+        "skipped_self": "Skipped this scanner's own skill",
+        "md_written": "Report written to",
+        "md_failed": "Could not write markdown report; showing stdout only",
+        "severity": {
+            "CRITICAL": "CRITICAL",
+            "HIGH": "HIGH",
+            "MEDIUM": "MEDIUM",
+            "LOW": "LOW",
+        },
+    },
+    "zh": {
+        "report_title": "Skill 安全扫描报告",
+        "overview": "总体检查情况",
+        "findings_section": "风险项",
+        "skills": "Skill 数",
+        "files": "文件数",
+        "roots": "扫描根目录",
+        "clean": "未发现安全问题。",
+        "remediation": "处置方案",
+        "skill": "Skill",
+        "risk_type": "风险类型",
+        "source": "出处",
+        "source_excerpt": "原文摘录",
+        "scanned_at": "检查时间",
+        "severity_counts": "风险级别统计",
+        "none": "（无）",
+        "act_now": "建议立即处理",
+        "act_soon": "建议尽快处理",
+        "review": "建议复核",
+        "duplicates": "重复拷贝（内容相同，未再扫描）",
+        "duplicate_of": "同于",
+        "skipped_self": "已跳过本扫描器自身 skill",
+        "md_written": "报告已写入",
+        "md_failed": "无法写入 Markdown 报告，仅输出到终端",
+        "severity": {
+            "CRITICAL": "严重",
+            "HIGH": "高",
+            "MEDIUM": "中",
+            "LOW": "低",
+        },
+    },
+}
+
+
+def normalize_lang(lang: Optional[str]) -> str:
+    """Normalize a language code to `en` or `zh`."""
+    if not lang:
+        return "en"
+    value = lang.strip().lower().replace("_", "-")
+    if value in {"zh", "zh-cn", "zh-hans", "cn", "chinese"}:
+        return "zh"
+    return "en"
+
+
+def ui(lang: str) -> dict:
+    """Return UI string table for the selected language."""
+    return UI_TEXT[normalize_lang(lang)]
+
+
+def category_title(category: str, lang: str = "en") -> str:
+    """Return the localized risk title for a finding category."""
+    lang = normalize_lang(lang)
+    if lang == "zh":
+        return CATEGORY_RISK_TITLES_ZH.get(
+            category, CATEGORY_RISK_TITLES.get(category, category)
+        )
+    return CATEGORY_RISK_TITLES.get(category, category)
+
+
+def severity_name(severity: Severity, lang: str = "en") -> str:
+    """Return a localized severity name."""
+    return ui(lang)["severity"][str(severity)]
+
 
 @dataclass
 class RiskSummary:
@@ -1440,9 +1666,10 @@ class RiskSummary:
     category: str
     skill_name: str
     statement: str
-    evidence: str
+    source_excerpt: str
     count: int
     detectors: list[str] = field(default_factory=list)
+    file_refs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Serialize the risk summary for JSON output."""
@@ -1452,10 +1679,293 @@ class RiskSummary:
             "category": self.category,
             "skill_name": self.skill_name,
             "statement": self.statement,
-            "evidence": self.evidence,
+            "source_excerpt": self.source_excerpt,
+            "file_refs": self.file_refs,
             "count": self.count,
             "detectors": self.detectors,
         }
+
+
+@dataclass
+class RemediationStep:
+    """One numbered remediation step, optionally with executable commands."""
+
+    title: str
+    commands: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """Serialize the remediation step for JSON output."""
+        return {"title": self.title, "commands": self.commands}
+
+
+@dataclass
+class RemediationItem:
+    """Actionable remediation for one skill (or a global follow-up)."""
+
+    skill_name: str
+    skill_path: str
+    severity: Severity
+    categories: list[str]
+    steps: list[RemediationStep]
+
+    def to_dict(self) -> dict:
+        """Serialize the remediation item for JSON output."""
+        return {
+            "skill_name": self.skill_name,
+            "skill_path": self.skill_path,
+            "severity": str(self.severity),
+            "categories": self.categories,
+            "steps": [s.to_dict() for s in self.steps],
+        }
+
+
+# Categories that imply credential / secret exposure risk.
+_CREDENTIAL_CATEGORIES = frozenset(
+    {
+        "credential_theft",
+        "data_exfiltration",
+        "forced_exfiltration",
+        "remote_workflow_exfiltration",
+    }
+)
+
+# Categories that imply third-party account / token handoff.
+_AUTH_CATEGORIES = frozenset({"third_party_auth"})
+
+# Categories that imply CLI auto-reinstall / persistence.
+_PERSISTENCE_CATEGORIES = frozenset(
+    {
+        "supply_chain_persistence",
+        "supply_chain",
+        "persistence",
+    }
+)
+
+# Categories that imply diversion / host lock-in.
+_DIVERSION_CATEGORIES = frozenset(
+    {
+        "platform_diversion",
+        "covert_tool_handoff",
+        "host_suppression",
+        "output_driven_execution",
+    }
+)
+
+# Categories that warrant immediate quarantine when CRITICAL/HIGH.
+_QUARANTINE_CATEGORIES = frozenset(
+    {
+        "remote_code_execution",
+        "threat_intelligence",
+        "credential_theft",
+        "data_exfiltration",
+        "forced_exfiltration",
+        "remote_workflow_exfiltration",
+        "supply_chain_persistence",
+        "platform_diversion",
+        "covert_tool_handoff",
+        "host_suppression",
+        "third_party_auth",
+        "output_driven_execution",
+        "privilege_escalation",
+    }
+)
+
+
+def _remediation_steps_for(
+    categories: set[str],
+    severity: Severity,
+    skill_path: str,
+    lang: str,
+) -> list[RemediationStep]:
+    """Build numbered remediation steps for a skill's categories."""
+    zh = lang == "zh"
+    steps: list[RemediationStep] = []
+    quarantine_cmds = _quarantine_commands(skill_path)
+
+    if categories & _QUARANTINE_CATEGORIES or severity >= Severity.HIGH:
+        title = "隔离该 skill" if zh else "Quarantine this skill"
+        if not quarantine_cmds:
+            title = (
+                "将该 skill 移出 Agent 加载路径（路径未知，请手动隔离）"
+                if zh
+                else "Move this skill out of agent load paths (path unknown — quarantine manually)"
+            )
+        steps.append(RemediationStep(title=title, commands=quarantine_cmds))
+
+    if categories & _CREDENTIAL_CATEGORIES:
+        steps.append(
+            RemediationStep(
+                title=(
+                    "若可能已上传敏感内容，轮换密钥/token"
+                    if zh
+                    else "If sensitive content may have been uploaded, rotate keys/tokens"
+                )
+            )
+        )
+
+    if categories & _AUTH_CATEGORIES:
+        steps.append(
+            RemediationStep(
+                title=(
+                    "检查并撤销相关第三方 CLI / OAuth 授权与本地 token"
+                    if zh
+                    else "Review and revoke related third-party CLI / OAuth grants and local tokens"
+                )
+            )
+        )
+
+    if categories & _DIVERSION_CATEGORIES:
+        steps.append(
+            RemediationStep(
+                title=(
+                    "改用宿主 Agent 原生工作流；删除会宽触发并导流的 skill"
+                    if zh
+                    else "Prefer host-native workflows; remove broad-trigger diversion skills"
+                )
+            )
+        )
+
+    if categories & _PERSISTENCE_CATEGORIES:
+        steps.append(
+            RemediationStep(
+                title=(
+                    "检查该 CLI 是否会静默重装 skill，必要时卸载该 CLI"
+                    if zh
+                    else "Check whether the CLI silently reinstalls skills; uninstall it if needed"
+                )
+            )
+        )
+
+    if "remote_code_execution" in categories or "threat_intelligence" in categories:
+        steps.append(
+            RemediationStep(
+                title=(
+                    "复查近期 shell / Agent 历史，确认是否已执行可疑命令"
+                    if zh
+                    else "Review recent shell / agent history for suspicious commands"
+                )
+            )
+        )
+
+    if "output_driven_execution" in categories:
+        steps.append(
+            RemediationStep(
+                title=(
+                    "不要盲目执行 CLI/工具输出中的建议命令"
+                    if zh
+                    else "Do not blindly run commands suggested by tool/CLI output"
+                )
+            )
+        )
+
+    if not steps:
+        steps.append(
+            RemediationStep(
+                title=(
+                    "人工复核该 skill 的触发范围与行为后再决定是否保留"
+                    if zh
+                    else "Manually review this skill's triggers/behavior before keeping it"
+                )
+            )
+        )
+    return steps
+
+
+def _quarantine_commands(skill_path: str) -> list[str]:
+    """Return shell commands to quarantine a skill directory when the path is known."""
+    if not skill_path:
+        return []
+    quoted = shlex.quote(skill_path)
+    return [
+        "mkdir -p ~/quarantine/skills",
+        f"mv {quoted} ~/quarantine/skills/",
+    ]
+
+
+def _rescan_command(lang: str) -> str:
+    """Return a re-scan command pointing at this scanner script when possible."""
+    script = Path(__file__).resolve()
+    base = f"python3 {shlex.quote(str(script))} --severity high --no-color"
+    if lang == "zh":
+        return f"{base} --lang zh"
+    return base
+
+
+def build_remediation_plan(
+    findings: Iterable[Finding], lang: str = "en"
+) -> list[RemediationItem]:
+    """Build per-skill remediation items plus a global follow-up when needed."""
+    lang = normalize_lang(lang)
+    findings_list = list(findings)
+    if not findings_list:
+        return []
+
+    grouped: dict[tuple[str, str], list[Finding]] = {}
+    for f in findings_list:
+        key = (f.skill_name or "(unknown)", f.skill_path or "")
+        grouped.setdefault(key, []).append(f)
+
+    items: list[RemediationItem] = []
+    for (skill_name, skill_path), items_f in grouped.items():
+        top = max(f.severity for f in items_f)
+        if top < Severity.HIGH:
+            continue
+        categories = sorted({f.category for f in items_f})
+        steps = _remediation_steps_for(set(categories), top, skill_path, lang)
+        items.append(
+            RemediationItem(
+                skill_name=skill_name,
+                skill_path=skill_path,
+                severity=top,
+                categories=categories,
+                steps=steps,
+            )
+        )
+
+    items.sort(key=lambda i: (-int(i.severity), i.skill_name, i.skill_path))
+
+    zh = lang == "zh"
+    global_steps: list[RemediationStep] = [
+        RemediationStep(
+            title="隔离后复扫确认 HIGH+ 告警消失" if zh else "Re-scan after cleanup to confirm HIGH+ is clear",
+            commands=[_rescan_command(lang)],
+        ),
+        RemediationStep(
+            title=(
+                "将 skill 名称、来源包/URL 与扫描 JSON 报给团队或安全联系人"
+                if zh
+                else "Report skill name, source package/URL, and scanner JSON to your team/security contact"
+            )
+        ),
+        RemediationStep(
+            title=(
+                "若来自市场/注册表，向运营方举报该 skill"
+                if zh
+                else "If it came from a marketplace/registry, report it to the operator"
+            )
+        ),
+    ]
+    if any(f.severity < Severity.HIGH for f in findings_list) and not items:
+        global_steps.insert(
+            0,
+            RemediationStep(
+                title=(
+                    "当前主要为中/低风险：人工复核描述与触发范围；必要时再隔离"
+                    if zh
+                    else "Findings are mostly MEDIUM/LOW: review scope/triggers; quarantine if still untrusted"
+                )
+            ),
+        )
+    items.append(
+        RemediationItem(
+            skill_name="*" if not zh else "（全局）",
+            skill_path="",
+            severity=max(f.severity for f in findings_list),
+            categories=[],
+            steps=global_steps,
+        )
+    )
+    return items
 
 
 def filter_findings(
@@ -1465,8 +1975,163 @@ def filter_findings(
     return [f for f in findings if f.severity >= min_severity]
 
 
-def build_risk_summaries(findings: Iterable[Finding]) -> list[RiskSummary]:
+def build_evidence_excerpt(
+    content: str,
+    line_number: int,
+    *,
+    before: int = EVIDENCE_CONTEXT_BEFORE,
+    after: int = EVIDENCE_CONTEXT_AFTER,
+    file_label: str = "",
+) -> str:
+    """Return only the hit line text (no line-number or filename prefix)."""
+    del file_label
+    lines = content.splitlines()
+    if not lines:
+        return ""
+    if line_number <= 0:
+        idx = 0
+    else:
+        idx = min(max(line_number, 1), len(lines)) - 1
+    start_i = max(0, idx - before)
+    end_i = min(len(lines), idx + after + 1)
+    parts: list[str] = []
+    for i in range(start_i, end_i):
+        raw = lines[i].rstrip("\n")
+        if len(raw) > EVIDENCE_MAX_LINE_CHARS:
+            raw = raw[: EVIDENCE_MAX_LINE_CHARS - 1] + "…"
+        parts.append(raw)
+    return "\n".join(parts)
+
+
+def collect_excerpt_hits(
+    items: list[Finding], limit: int = EVIDENCE_SUMMARY_LIMIT
+) -> list[Finding]:
+    """Pick up to ``limit`` distinct hit lines, highest severity first."""
+    ranked = sorted(
+        items,
+        key=lambda x: (-int(x.severity), -x.confidence, x.file_path, x.line_number),
+    )
+    hits: list[Finding] = []
+    seen: set[tuple[str, int]] = set()
+    for f in ranked:
+        if not f.line_content:
+            continue
+        key = (f.file_path, f.line_number)
+        if key in seen:
+            continue
+        seen.add(key)
+        hits.append(f)
+        if len(hits) >= limit:
+            break
+    return hits
+
+
+def collect_source_excerpts(
+    items: list[Finding], limit: int = EVIDENCE_SUMMARY_LIMIT
+) -> str:
+    """Merge up to ``limit`` distinct hit-line excerpts (raw line text only)."""
+    return "\n".join(f.line_content.strip() for f in collect_excerpt_hits(items, limit))
+
+
+def markdown_fence(text: str, info: str = "md") -> str:
+    """Wrap ``text`` in a CommonMark fence longer than any backtick run inside it."""
+    longest = 0
+    run = 0
+    for ch in text:
+        if ch == "`":
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    ticks = "`" * max(3, longest + 1)
+    return f"{ticks}{info}\n{text.rstrip()}\n{ticks}"
+
+
+def markdown_file_link(file_path: str, line_number: int = 0) -> str:
+    """Return a markdown link that jumps to ``file_path`` at ``line_number``."""
+    raw = (file_path or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw).expanduser()
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    if not resolved.is_absolute():
+        resolved = Path.cwd() / resolved
+    label = f"{resolved}:{line_number}" if line_number > 0 else str(resolved)
+    try:
+        uri = resolved.as_uri()
+    except ValueError:
+        uri = str(resolved)
+    if line_number > 0:
+        uri = f"{uri}#L{line_number}"
+    return f"[{label}]({uri})"
+
+
+def group_findings_for_report(
+    findings: Iterable[Finding],
+) -> dict[Severity, list[tuple[str, str, list[Finding]]]]:
+    """Group findings by severity, then by skill and risk category."""
+    buckets: dict[tuple[Severity, str, str], list[Finding]] = {}
+    for finding in findings:
+        key = (
+            finding.severity,
+            finding.skill_name or "(unknown)",
+            finding.category,
+        )
+        buckets.setdefault(key, []).append(finding)
+
+    grouped: dict[Severity, list[tuple[str, str, list[Finding]]]] = {
+        severity: [] for severity in SEVERITY_ORDER
+    }
+    for (severity, skill_name, category), items in sorted(
+        buckets.items(),
+        key=lambda kv: (-int(kv[0][0]), kv[0][1], kv[0][2]),
+    ):
+        items_sorted = sorted(items, key=lambda x: (x.file_path, x.line_number))
+        grouped[severity].append((skill_name, category, items_sorted))
+    return grouped
+
+
+def urgency_phrase(severity: Severity, lang: str = "en") -> str:
+    """Return a short urgency hint for remediation headers."""
+    text_ui = ui(lang)
+    if severity >= Severity.CRITICAL:
+        return text_ui["act_now"]
+    if severity >= Severity.HIGH:
+        return text_ui["act_soon"]
+    return text_ui["review"]
+
+
+def remediation_header(
+    item: RemediationItem, *, use_emoji: bool = True, lang: str = "en"
+) -> str:
+    """Format a remediation skill header like ``🔴 name（严重 — 建议立即处理）``."""
+    lang = normalize_lang(lang)
+    sev = severity_name(item.severity, lang)
+    urgency = urgency_phrase(item.severity, lang)
+    emoji = f"{SEVERITY_EMOJI.get(item.severity, '⚪')} " if use_emoji else ""
+    if lang == "zh":
+        return f"{emoji}{item.skill_name}（{sev} — {urgency}）"
+    return f"{emoji}{item.skill_name} ({sev} — {urgency})"
+
+
+def print_remediation_steps(steps: list[RemediationStep]) -> None:
+    """Print numbered remediation steps; wrap shell commands in bash fences."""
+    for i, step in enumerate(steps, 1):
+        print(f"{i}. {step.title}")
+        print()
+        if step.commands:
+            print(markdown_fence("\n".join(step.commands), "bash"))
+            print()
+
+
+def build_risk_summaries(
+    findings: Iterable[Finding], lang: str = "en"
+) -> list[RiskSummary]:
     """Collapse findings into per-skill risk statements for the summary section."""
+    lang = normalize_lang(lang)
     grouped: dict[tuple[str, str], list[Finding]] = {}
     for f in findings:
         key = (f.skill_name or "(unknown)", f.category)
@@ -1475,10 +2140,16 @@ def build_risk_summaries(findings: Iterable[Finding]) -> list[RiskSummary]:
     summaries: list[RiskSummary] = []
     for (skill_name, category), items in grouped.items():
         top = max(items, key=lambda x: (int(x.severity), x.confidence))
-        title = CATEGORY_RISK_TITLES.get(category, top.description)
-        # Prefer the concrete detector description when it is more specific than the title.
-        statement = top.description if top.description else title
-        evidence = next((i.line_content for i in items if i.line_content), "")
+        if lang == "zh":
+            statement = category_title(category, "zh")
+        else:
+            statement = top.description or category_title(category, "en")
+        hits = collect_excerpt_hits(items)
+        excerpt = "\n".join(f.line_content.strip() for f in hits)
+        file_refs = [
+            f"{f.file_path}:{f.line_number}" if f.line_number > 0 else f.file_path
+            for f in hits
+        ]
         detectors = sorted({i.detector for i in items})
         summaries.append(
             RiskSummary(
@@ -1487,9 +2158,10 @@ def build_risk_summaries(findings: Iterable[Finding]) -> list[RiskSummary]:
                 category=category,
                 skill_name=skill_name,
                 statement=statement,
-                evidence=evidence[:180],
+                source_excerpt=excerpt,
                 count=len(items),
                 detectors=detectors,
+                file_refs=file_refs,
             )
         )
 
@@ -1497,54 +2169,145 @@ def build_risk_summaries(findings: Iterable[Finding]) -> list[RiskSummary]:
     return summaries
 
 
-def severity_label(severity: Severity, use_emoji: bool = True) -> str:
-    """Format a severity tag, optionally with a leading emoji."""
-    if use_emoji:
-        return f"{SEVERITY_EMOJI.get(severity, '⚪')} [{severity}]"
-    return f"[{severity}]"
-
-
-def layer_label(layer: str, use_emoji: bool = True) -> str:
-    """Format a layer tag, optionally with a leading emoji."""
-    if use_emoji:
-        return f"{LAYER_EMOJI.get(layer, '📎')} {layer}"
-    return layer
-
-
-def print_risk_summary(
-    summaries: list[RiskSummary], use_color: bool = True, use_emoji: bool = True
+def print_overview(
+    result: ScanResult, *, use_emoji: bool = True, lang: str = "en"
 ) -> None:
-    """Print the condensed risk-statement summary block."""
-    colors = {
-        Severity.CRITICAL: "\033[91m" if use_color else "",
-        Severity.HIGH: "\033[91m" if use_color else "",
-        Severity.MEDIUM: "\033[93m" if use_color else "",
-        Severity.LOW: "\033[94m" if use_color else "",
-    }
-    reset = "\033[0m" if use_color else ""
-    title = "📋 RISK STATEMENT SUMMARY" if use_emoji else "RISK STATEMENT SUMMARY"
+    """Print the scan-overview section (counts, roots, skips, duplicates)."""
+    lang = normalize_lang(lang)
+    text = ui(lang)
+    scanned_at = result.scanned_at or format_scan_time()
+    counts = result.counts_by_severity()
+    print(f"## {text['overview']}")
+    print()
+    sep = "：" if lang == "zh" else ": "
+    print(f"- **{text['scanned_at']}**{sep}{scanned_at}")
+    print(f"- **{text['skills']}**{sep}{result.skills_scanned}")
+    print(f"- **{text['files']}**{sep}{result.files_scanned}")
+    count_bits: list[str] = []
+    for severity in SEVERITY_ORDER:
+        name = severity_name(severity, lang)
+        mark = f"{SEVERITY_EMOJI[severity]} " if use_emoji else ""
+        count_bits.append(f"{mark}{name} {counts[severity.name]}")
+    print(f"- **{text['severity_counts']}**{sep}{' · '.join(count_bits)}")
+    if result.skill_roots:
+        print(f"- **{text['roots']}**{sep}")
+        for root in result.skill_roots:
+            print(f"  - `{root}`")
+    if result.skipped_self:
+        print(f"- **{text['skipped_self']}**{sep}")
+        for path in result.skipped_self:
+            print(f"  - `{path}`")
+    if result.duplicate_copies:
+        print(f"- **{text['duplicates']}**{sep}")
+        for dup in result.duplicate_copies:
+            print(
+                f"  - `{dup.name}`: `{dup.copy_path}` "
+                f"({text['duplicate_of']} `{dup.scanned_path}`)"
+            )
+    print()
 
-    print(f"  {title}")
-    print("  " + "-" * 66)
-    if not summaries:
-        print("  (none)")
+
+def unique_findings_by_location(items: list[Finding]) -> list[Finding]:
+    """Keep the first finding for each file:line so source links are not repeated."""
+    seen: set[tuple[str, int]] = set()
+    unique: list[Finding] = []
+    for finding in items:
+        key = (finding.file_path, finding.line_number)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(finding)
+    return unique
+
+
+def print_finding_fields(
+    skill_name: str,
+    risk_title: str,
+    items: list[Finding],
+    *,
+    lang: str = "en",
+) -> None:
+    """Print skill, risk type, clickable sources, and fenced excerpts."""
+    text = ui(lang)
+    sep = "：" if lang == "zh" else ": "
+    shown = unique_findings_by_location(items)
+    print(f"- **{text['skill']}**{sep}`{skill_name}`")
+    print(f"- **{text['risk_type']}**{sep}{risk_title}")
+    if len(shown) == 1:
+        finding = shown[0]
+        print(
+            f"- **{text['source']}**{sep}"
+            f"{markdown_file_link(finding.file_path, finding.line_number)}"
+        )
+    else:
+        print(f"- **{text['source']}**{sep}")
+        for finding in shown:
+            print(
+                f"  - {markdown_file_link(finding.file_path, finding.line_number)}"
+            )
+    excerpts = "\n".join(
+        finding.line_content.strip()
+        for finding in shown
+        if finding.line_content and finding.line_content.strip()
+    )
+    if excerpts:
+        print(f"- **{text['source_excerpt']}**{sep}")
+        print()
+        print(markdown_fence(excerpts, "md"))
+    print()
+
+
+def print_findings_section(
+    findings: list[Finding],
+    *,
+    summary_only: bool = False,
+    use_emoji: bool = True,
+    lang: str = "en",
+) -> None:
+    """Print findings grouped by severity heading, then risk-item heading."""
+    lang = normalize_lang(lang)
+    text = ui(lang)
+    print(f"## {text['findings_section']}")
+    print()
+    if not findings:
+        print(text["clean"])
         print()
         return
-    for s in summaries:
-        c = colors.get(s.severity, "")
-        label = severity_label(s.severity, use_emoji=use_emoji)
-        print(f"  {c}{label}{reset} {s.skill_name}")
-        print(f"    {'⚠️  ' if use_emoji else ''}Risk: {s.statement}")
-        print(
-            f"    Category: {s.category}  "
-            f"Layer: {layer_label(s.layer, use_emoji=use_emoji)}  "
-            f"Hits: {s.count}"
-        )
-        if s.detectors:
-            print(f"    {'🔎 ' if use_emoji else ''}Detectors: {', '.join(s.detectors)}")
-        if s.evidence:
-            print(f"    {'📝 ' if use_emoji else ''}Evidence: {s.evidence}")
+
+    grouped = group_findings_for_report(findings)
+    for severity in SEVERITY_ORDER:
+        groups = grouped.get(severity) or []
+        if not groups:
+            continue
+        sev_name = severity_name(severity, lang)
+        heading = f"{SEVERITY_EMOJI[severity]} {sev_name}" if use_emoji else sev_name
+        print(f"### {heading}")
         print()
+        for skill_name, category, items in groups:
+            shown = items if not summary_only else collect_excerpt_hits(items)
+            title = category_title(category, lang)
+            print(f"#### {title}")
+            print()
+            print_finding_fields(skill_name, title, shown, lang=lang)
+
+
+def print_remediation(
+    items: list[RemediationItem],
+    use_emoji: bool = True,
+    lang: str = "en",
+) -> None:
+    """Print the remediation plan as H2/H3 markdown with fenced commands."""
+    lang = normalize_lang(lang)
+    text = ui(lang)
+    if not items:
+        return
+
+    print(f"## {text['remediation']}")
+    print()
+    for item in items:
+        print(f"### {remediation_header(item, use_emoji=use_emoji, lang=lang)}")
+        print()
+        print_remediation_steps(item.steps)
 
 
 def print_report(
@@ -1552,73 +2315,28 @@ def print_report(
     use_color: bool = True,
     summary_only: bool = False,
     use_emoji: bool = True,
+    lang: str = "en",
 ) -> None:
-    """Print a human-readable audit report to stdout."""
-    colors = {
-        Severity.CRITICAL: "\033[91m" if use_color else "",
-        Severity.HIGH: "\033[91m" if use_color else "",
-        Severity.MEDIUM: "\033[93m" if use_color else "",
-        Severity.LOW: "\033[94m" if use_color else "",
-    }
-    reset = "\033[0m" if use_color else ""
-    counts = result.counts_by_severity()
-    summaries = build_risk_summaries(result.findings)
-    report_title = "🛡️  SKILL SECURITY SCAN REPORT" if use_emoji else "SKILL SECURITY SCAN REPORT"
-
-    print("=" * 70)
-    print(f"  {report_title}")
-    print(
-        f"  {'📦 ' if use_emoji else ''}Skills: {result.skills_scanned}  "
-        f"{'📄 ' if use_emoji else ''}Files: {result.files_scanned}"
-    )
-    if result.skill_roots:
-        print(f"  {'📂 ' if use_emoji else ''}Roots:")
-        for root in result.skill_roots:
-            print(f"    - {root}")
-    print("=" * 70)
-    print(
-        f"  {SEVERITY_EMOJI[Severity.CRITICAL] if use_emoji else ''} CRITICAL: {counts['CRITICAL']}  "
-        f"{SEVERITY_EMOJI[Severity.HIGH] if use_emoji else ''} HIGH: {counts['HIGH']}  "
-        f"{SEVERITY_EMOJI[Severity.MEDIUM] if use_emoji else ''} MEDIUM: {counts['MEDIUM']}  "
-        f"{SEVERITY_EMOJI[Severity.LOW] if use_emoji else ''} LOW: {counts['LOW']}"
-    )
+    """Print the markdown audit report (headings, findings, remediation)."""
+    del use_color
+    lang = normalize_lang(lang)
+    text = ui(lang)
+    scanned_at = result.scanned_at or format_scan_time()
+    print(f"# {text['report_title']} · {scanned_at}")
     print()
-
-    if not result.findings:
-        clean = "✅ [CLEAN] No security issues detected." if use_emoji else "[CLEAN] No security issues detected."
-        print(f"  {clean}")
-        print()
-        return
-
-    print_risk_summary(summaries, use_color=use_color, use_emoji=use_emoji)
-    if summary_only:
-        return
-
-    by_skill: dict[str, list[Finding]] = {}
-    for f in sorted(result.findings, key=lambda x: (-int(x.severity), x.skill_name, x.file_path)):
-        by_skill.setdefault(f.skill_name or "(unknown)", []).append(f)
-
-    detail_title = "🔍 DETAILED FINDINGS" if use_emoji else "DETAILED FINDINGS"
-    print(f"  {detail_title}")
-    print("  " + "-" * 66)
-    for skill_name, findings in by_skill.items():
-        print("-" * 70)
-        skill_prefix = "🧩 " if use_emoji else ""
-        print(f"  {skill_prefix}Skill: {skill_name}  ({len(findings)} finding(s))")
-        for f in findings:
-            c = colors.get(f.severity, "")
-            label = severity_label(f.severity, use_emoji=use_emoji)
-            print(
-                f"    {c}{label}{reset} "
-                f"[{layer_label(f.layer, use_emoji=use_emoji)}] {f.detector}"
-            )
-            print(f"      Category: {f.category}")
-            print(f"      {'📁 ' if use_emoji else ''}File: {f.file_path}:{f.line_number}")
-            print(f"      {'⚠️  ' if use_emoji else ''}{f.description}")
-            print(f"      Confidence: {f.confidence}%")
-            if f.line_content:
-                print(f"      {'📝 ' if use_emoji else ''}> {f.line_content}")
-            print()
+    print_overview(result, use_emoji=use_emoji, lang=lang)
+    print_findings_section(
+        result.findings,
+        summary_only=summary_only,
+        use_emoji=use_emoji,
+        lang=lang,
+    )
+    if result.findings:
+        print_remediation(
+            build_remediation_plan(result.findings, lang=lang),
+            use_emoji=use_emoji,
+            lang=lang,
+        )
 
 
 def exit_code_for(result: ScanResult) -> int:
@@ -1631,6 +2349,41 @@ def exit_code_for(result: ScanResult) -> int:
     if m >= Severity.HIGH:
         return 2
     return 1
+
+
+def render_report_text(
+    result: ScanResult,
+    *,
+    summary_only: bool = False,
+    use_emoji: bool = True,
+    lang: str = "en",
+) -> str:
+    """Render the human-readable report as plain text (no ANSI colors)."""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        print_report(
+            result,
+            use_color=False,
+            summary_only=summary_only,
+            use_emoji=use_emoji,
+            lang=lang,
+        )
+    return buf.getvalue()
+
+
+def default_md_report_path() -> Path:
+    """Return the default markdown report path in the current working directory."""
+    return Path.cwd() / DEFAULT_MD_REPORT_NAME
+
+
+def write_markdown_report(path: Path, body: str) -> Optional[Path]:
+    """Write ``body`` to ``path``. Return the path on success, else None."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        return path.resolve()
+    except OSError:
+        return None
 
 
 def parse_severity(value: str) -> Severity:
@@ -1662,7 +2415,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--summary-only",
         action="store_true",
-        help="Print only the risk statement summary (ignored with --json)",
+        help="Limit excerpts per risk item (ignored with --json)",
     )
     p.add_argument(
         "--severity",
@@ -1677,6 +2430,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable emoji markers in the text report",
     )
     p.add_argument(
+        "--lang",
+        choices=["en", "zh"],
+        default="en",
+        help="Report language: en (default) or zh",
+    )
+    p.add_argument(
+        "--md",
+        metavar="PATH",
+        help=(
+            "Write the text report to this markdown file "
+            f"(default: ./{DEFAULT_MD_REPORT_NAME})"
+        ),
+    )
+    p.add_argument(
+        "--no-md",
+        action="store_true",
+        help="Do not write a markdown report file",
+    )
+    p.add_argument(
         "--ioc-db",
         help="Path to an alternate IOC JSON database",
     )
@@ -1686,6 +2458,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     """CLI entrypoint: discover or target skills, scan, and report."""
     args = build_arg_parser().parse_args(argv)
+    lang = normalize_lang(args.lang)
     discovery = SkillDiscovery()
     if args.path:
         skills = discovery.discover_single(args.path)
@@ -1693,22 +2466,50 @@ def main(argv: Optional[list[str]] = None) -> int:
         skills = discovery.discover(project_root=Path(args.project).resolve())
 
     if not skills:
-        print("[WARN] No skills found to scan.", file=sys.stderr)
+        warn = (
+            "[警告] 未找到可扫描的 skill。"
+            if lang == "zh"
+            else "[WARN] No skills found to scan."
+        )
+        print(warn, file=sys.stderr)
         return 0
 
     ioc = IOCDatabase(args.ioc_db) if args.ioc_db else IOCDatabase()
     scanner = SkillScanner(ioc)
     result = scanner.scan_skills(skills)
     result.findings = filter_findings(result.findings, args.severity)
-    summaries = build_risk_summaries(result.findings)
+    summaries = build_risk_summaries(result.findings, lang=lang)
+    remediation = build_remediation_plan(result.findings, lang=lang)
+    text = ui(lang)
+    md_path: Optional[Path] = None
+    if not args.no_md:
+        dest = Path(args.md).expanduser() if args.md else default_md_report_path()
+        body = render_report_text(
+            result,
+            summary_only=args.summary_only,
+            use_emoji=not args.no_emoji,
+            lang=lang,
+        )
+        md_path = write_markdown_report(dest, body)
+        if md_path is None:
+            print(f"{text['md_failed']}: {dest}", file=sys.stderr)
+        else:
+            print(f"{text['md_written']}: {md_path}", file=sys.stderr)
 
     if args.json:
         payload = {
             "skills_scanned": result.skills_scanned,
             "files_scanned": result.files_scanned,
             "skill_roots": result.skill_roots,
+            "skill_paths": result.skill_paths,
+            "skipped_self": result.skipped_self,
+            "duplicate_copies": [d.to_dict() for d in result.duplicate_copies],
+            "lang": lang,
+            "scanned_at": result.scanned_at,
+            "report_md": str(md_path) if md_path else None,
             "severity_counts": result.counts_by_severity(),
             "risk_summaries": [s.to_dict() for s in summaries],
+            "remediation": [r.to_dict() for r in remediation],
             "findings": [f.to_dict() for f in result.findings],
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -1718,6 +2519,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             use_color=not args.no_color and sys.stdout.isatty(),
             summary_only=args.summary_only,
             use_emoji=not args.no_emoji,
+            lang=lang,
         )
 
     return exit_code_for(result)
