@@ -19,9 +19,10 @@ Built to cover gaps that malware-only scanners miss — for example skills that 
 ## Install
 
 ```bash
-npx skills add RJiazhen/skill-security-scan -g -y
+npx skills add RJiazhen/skill-security-scan -g -y -a cursor
 ```
 
+If you see `PromptScript does not support global skill installation`, add `-a cursor` (or another supported agent). Do not install globally to PromptScript.
 After install, use it directly in Cursor / Claude (or similar) agent chats.
 
 ---
@@ -40,7 +41,13 @@ Or more casually:
 
 > Check for malicious skills / run a skill security scan.
 
-The agent follows this skill’s workflow, auto-discovers local skill directories, runs the scanner, and summarizes CRITICAL / HIGH / MEDIUM / LOW findings.
+The agent follows this skill’s workflow, auto-discovers local skill directories, and by default returns a **full markdown report** (also written to `./skill-security-scan-report.md` unless the user opts out or the environment cannot create the file): scan overview, findings grouped by severity with clickable source links and excerpts, then a **remediation plan** with fenced shell commands (quarantine `mv`, re-scan) when paths are known. The script only marks candidate language; the agent reviews each hit (host built-in vs external destination, concrete 说明) before presenting the report, and only mentions the written file path at the end.
+
+When the user chats in Chinese, the agent should present the **final report in Chinese** (`--lang zh`). English chats use the default English report.
+
+To ask for summaries only:
+
+> Use skill-security-scan and only show the risk statement summary.
 
 ### Example 2: Focus on diversion and silent upload
 
@@ -87,12 +94,12 @@ For a diversion-style sample, the agent report may include:
 | HIGH | `RemoteWorkflowExfiltrationDetector` | Remote messages auto-attach local source files |
 | HIGH | `OutputDrivenCommandDetector` | Runs repair commands emitted by CLI output |
 | HIGH | `ThirdPartyAuthHandoffDetector` | Background vendor account authorization |
-| HIGH | `CovertToolHandoffDetector` | Routes work to an external tool without the user naming it |
+| HIGH | `CovertToolHandoffDetector` | Candidate: route-without-naming language (agent confirms external destination) |
 | HIGH | `HostCapabilitySuppressionDetector` | Forbids falling back to host capabilities |
 
 When **multiple L2/L3 signals appear on the same skill**, treat it as high risk even without a classic backdoor.
 
-Remediation outline: stop using it → move it out of agent load paths → check whether a CLI will reinstall it → rotate secrets if needed → re-scan. See [`references/remediation.md`](skills/skill-security-scan/references/remediation.md).
+Remediation outline: stop using it → move it out of agent load paths → check whether a CLI will reinstall it → rotate secrets if needed → re-scan. The report’s trailing **Remediation plan** adds category-aware steps and executable quarantine/re-scan commands when skill paths are known. See [`references/remediation.md`](skills/skill-security-scan/references/remediation.md).
 
 ---
 
@@ -102,6 +109,7 @@ Common auto-discovered paths:
 
 - `~/.cursor/skills`, project `.cursor/skills`
 - `~/.claude/skills`, `~/.agents/skills`, `~/.codex/skills`
+- `~/.trae/skills`, `~/.trae-cn/skills`, project `.trae/skills` (Trae / Trae CN)
 - `~/.openclaw/**/skills`, `~/.coze/skills`, and similar
 
 | Detector | Layer | Catches |
@@ -114,7 +122,7 @@ Common auto-discovered paths:
 | PlatformDiversionDetector | L2 | Broad “software development” trigger → third-party CLI |
 | ForcedUploadDetector | L2 | Forced / automatic upload of local files |
 | RemoteWorkflowExfiltrationDetector | L2 | Remote message workflows that pull in local files |
-| CovertToolHandoffDetector | L2 | Hands work to external tools without user naming them |
+| CovertToolHandoffDetector | L2 | Candidate: route-without-naming language (review destination) |
 | HostCapabilitySuppressionDetector | L2 | Blocks host built-in capabilities |
 | ThirdPartyAuthHandoffDetector | L2 | Vendor account authorization (especially background) |
 | SilentSkillInstallDetector | L3 | Silent skill install into agents |
@@ -130,14 +138,29 @@ Pattern notes: [`threat-patterns.md`](skills/skill-security-scan/references/thre
 Most users **do not** need this. Use it for CI, local development, or when the agent is unavailable.
 
 ```bash
-# Scan the machine
+# Full detailed report (default; also writes ./skill-security-scan-report.md)
 python3 skills/skill-security-scan/scripts/scan.py --no-color
+
+# Agent/CI: write the file only (avoid truncated stdout captures)
+python3 skills/skill-security-scan/scripts/scan.py --no-color --quiet
+
+# Stdout only (no markdown file)
+python3 skills/skill-security-scan/scripts/scan.py --no-color --no-md
+
+# Full detailed Chinese report
+python3 skills/skill-security-scan/scripts/scan.py --no-color --lang zh
+
+# Risk statement summary only (when the user asks)
+python3 skills/skill-security-scan/scripts/scan.py --summary-only --severity medium --no-color
 
 # Scan one directory
 python3 skills/skill-security-scan/scripts/scan.py --path /path/to/skill --no-color
 
-# JSON
+# JSON (includes risk_summaries; statements follow --lang)
 python3 skills/skill-security-scan/scripts/scan.py --json --severity medium --no-color
+
+# Plain text without emoji (CI / logs)
+python3 skills/skill-security-scan/scripts/scan.py --no-emoji --no-color
 ```
 
 Exit codes: `0` clean · `1` low/medium · `2` high · `3` critical
